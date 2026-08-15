@@ -1,0 +1,2 @@
+# dencken-core
+Dencken Core
