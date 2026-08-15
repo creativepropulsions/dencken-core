@@ -1,0 +1,27 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.csr
+*.pub
+
+# Node dependencies and build artifacts
+node_modules/
+*.log
+
+# Runtime and private app state
+config/
+data/
+ledger-public/
+tmp/
+
+# Editor / tooling
+.vscode/
+.DS_Store
+
+# Keep example templates in repo
+!node_private.pem.example
+!.env.example
