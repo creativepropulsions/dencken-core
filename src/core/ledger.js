@@ -73,9 +73,7 @@ initLedger();
 
 const fallbackAvailable = () => {
   try {
-    if (!fs.existsSync(dataDir)) {
-      fs.mkdirSync(dataDir, { recursive: true });
-    }
+    ensureFallbackLedgerReady();
     const testFile = path.join(dataDir, `.fallback-${Date.now()}.tmp`);
     fs.writeFileSync(testFile, 'ok', 'utf8');
     fs.unlinkSync(testFile);
@@ -86,7 +84,7 @@ const fallbackAvailable = () => {
 };
 
 const cleanupLedgerFiles = () => {
-  const filesToRemove = [fallbackPath, dbPath, `${dbPath}-shm`, `${dbPath}-wal`];
+  const filesToRemove = [dbPath, `${dbPath}-shm`, `${dbPath}-wal`];
   for (const filePathToRemove of filesToRemove) {
     try {
       if (fs.existsSync(filePathToRemove)) {
@@ -131,17 +129,32 @@ const ledgerType = () => {
 
 const getLedgerHeight = () => {
   return new Promise((resolve, reject) => {
-    if (!available || !db) {
-      return resolve(0);
+    if (available && db) {
+      return db.get('SELECT COUNT(*) AS count FROM ledger_entries', (err, row) => {
+        if (err) {
+          console.error('Failed to query ledger height:', err.message);
+          return resolve(0);
+        }
+        return resolve(row ? row.count : 0);
+      });
     }
 
-    db.get('SELECT COUNT(*) AS count FROM ledger_entries', (err, row) => {
-      if (err) {
-        console.error('Failed to query ledger height:', err.message);
+    try {
+      if (!fs.existsSync(fallbackPath)) {
         return resolve(0);
       }
-      resolve(row ? row.count : 0);
-    });
+
+      const data = fs.readFileSync(fallbackPath, 'utf8').trim();
+      if (!data) {
+        return resolve(0);
+      }
+
+      const lines = data.split(/\r?\n/).filter(Boolean);
+      return resolve(lines.length);
+    } catch (err) {
+      console.error('Failed to read fallback ledger height:', err.message);
+      return resolve(0);
+    }
   });
 };
 
@@ -172,6 +185,21 @@ const uuid = (typeof crypto.randomUUID === 'function') ? crypto.randomUUID : () 
 };
 
 const fallbackPath = path.join(dataDir, 'ledger.jsonl');
+
+const ensureFallbackLedgerReady = () => {
+  try {
+    if (!fs.existsSync(dataDir)) {
+      fs.mkdirSync(dataDir, { recursive: true });
+    }
+    if (!fs.existsSync(fallbackPath)) {
+      fs.writeFileSync(fallbackPath, '', 'utf8');
+    }
+    return true;
+  } catch (err) {
+    console.error('Failed to initialize ledger fallback storage:', err.message);
+    return false;
+  }
+};
 
 const normalizePem = (rawPem) => {
   if (!rawPem) return null;
@@ -354,6 +382,7 @@ const appendFallbackRecord = async (opts = {}) => {
 
 const readFallbackEntries = ({ limit = 50, offset = 0 } = {}) => {
   try {
+    ensureFallbackLedgerReady();
     if (!fs.existsSync(fallbackPath)) return [];
     const data = fs.readFileSync(fallbackPath, 'utf8').trim();
     if (!data) return [];
@@ -389,6 +418,8 @@ const verifyEntrySignature = (entry) => {
 
 module.exports.isAvailable = isAvailable;
 module.exports.ledgerType = ledgerType;
+module.exports.getLedgerHeight = getLedgerHeight;
+module.exports.getEntries = getEntries;
 module.exports.appendFallbackRecord = appendFallbackRecord;
 module.exports.readFallbackEntries = readFallbackEntries;
 module.exports.verifyEntrySignature = verifyEntrySignature;

@@ -69,23 +69,46 @@ router.get('/admin/logout', (req, res) => {
 });
 
 // Read ledger entries (reads fallback if sqlite not available)
+const readLedgerEntries = async ({ limit = 50, offset = 0 } = {}) => {
+  if (typeof ledger.getEntries === 'function') {
+    const sqliteEntries = await ledger.getEntries({ limit, offset });
+    if (Array.isArray(sqliteEntries) && sqliteEntries.length > 0) {
+      return sqliteEntries;
+    }
+  }
+
+  if (typeof ledger.readFallbackEntries === 'function') {
+    return ledger.readFallbackEntries({ limit, offset });
+  }
+
+  return [];
+};
+
+const appendLedgerRecord = async (opts = {}) => {
+  if (typeof ledger.appendRecord === 'function') {
+    try {
+      const entry = await ledger.appendRecord(opts);
+      if (entry) {
+        return entry;
+      }
+    } catch (err) {
+      console.warn('Unified ledger append failed, falling back to file ledger:', err.message);
+    }
+  }
+
+  if (typeof ledger.appendFallbackRecord === 'function') {
+    return ledger.appendFallbackRecord(opts);
+  }
+
+  throw new Error('No ledger appender available');
+};
+
 router.get('/ledger', async (req, res) => {
   try {
     const limit = parseInt(req.query.limit || '50', 10);
     const offset = parseInt(req.query.offset || '0', 10);
-
-    if (typeof ledger.readFallbackEntries === 'function') {
-      const entries = ledger.readFallbackEntries({ limit, offset });
-      return res.json({ ok: true, entries });
-    }
-
-    // if sqlite available, use getEntries
-    if (typeof ledger.getEntries === 'function') {
-      const entries = await ledger.getEntries({ limit, offset });
-      return res.json({ ok: true, entries });
-    }
-
-    return res.status(500).json({ ok: false, error: 'No ledger reader available' });
+    const entries = await readLedgerEntries({ limit, offset });
+    return res.json({ ok: true, entries });
   } catch (err) {
     return res.status(500).json({ ok: false, error: err.message });
   }
@@ -115,21 +138,21 @@ router.get('/ledger/test/browser', requireAdminAuth, (req, res) => {
 router.post('/ledger/test/browser', requireAdminAuth, async (req, res) => {
   try {
     const { record_type, content_plain } = req.body || {};
-    if (typeof ledger.appendFallbackRecord === 'function') {
-      const entry = await ledger.appendFallbackRecord({ record_type: record_type || 'test', content_plain: content_plain || 'test' });
-      return res.type('text/html').send(`
-        <html>
-          <head><title>Ledger Signature Test Result</title></head>
-          <body>
-            <h1>Ledger Test Result</h1>
-            <pre>${JSON.stringify(entry, null, 2)}</pre>
-            <p><a href="/ledger/test">Back</a></p>
-          </body>
-        </html>
-      `);
-    }
+    const entry = await appendLedgerRecord({
+      record_type: record_type || 'test',
+      content_plain: content_plain || 'test',
+    });
 
-    return res.status(500).json({ ok: false, error: 'No fallback ledger available' });
+    return res.type('text/html').send(`
+      <html>
+        <head><title>Ledger Signature Test Result</title></head>
+        <body>
+          <h1>Ledger Test Result</h1>
+          <pre>${JSON.stringify(entry, null, 2)}</pre>
+          <p><a href="/ledger/test">Back</a></p>
+        </body>
+      </html>
+    `);
   } catch (err) {
     return res.status(500).json({ ok: false, error: err.message });
   }
@@ -139,18 +162,24 @@ router.get('/diag', requireAdminAuth, (req, res) => {
   return res.redirect('/dashboard');
 });
 
-router.get('/status', (req, res) => {
-  const dataDir = path.join(__dirname, '../../data');
-  const nodePublicKey = getNodePublicKey();
-  const status = {
-    ok: true,
-    node_id: getNodeId(),
-    node_public_key_present: Boolean(nodePublicKey),
-    data_dir_exists: fs.existsSync(dataDir),
-    ledger_available: typeof ledger.isAvailable === 'function' ? ledger.isAvailable() : false,
-    timestamp: new Date().toISOString(),
-  };
-  return res.json(status);
+router.get('/status', async (req, res) => {
+  try {
+    const dataDir = path.join(__dirname, '../../data');
+    const nodePublicKey = getNodePublicKey();
+    const ledgerHeight = typeof ledger.getLedgerHeight === 'function' ? await ledger.getLedgerHeight() : 0;
+    const status = {
+      ok: true,
+      node_id: getNodeId(),
+      node_public_key_present: Boolean(nodePublicKey),
+      data_dir_exists: fs.existsSync(dataDir),
+      ledger_available: typeof ledger.isAvailable === 'function' ? ledger.isAvailable() : false,
+      ledger_height: ledgerHeight,
+      timestamp: new Date().toISOString(),
+    };
+    return res.json(status);
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err.message });
+  }
 });
 
 router.get('/cycle/test', requireAdminAuth, async (req, res) => {
@@ -180,6 +209,34 @@ router.get('/cycle/test/browser', requireAdminAuth, async (req, res) => {
   }
 });
 
+const formatEnvValue = (value) => {
+  if (value === undefined || value === null) return '';
+  return JSON.stringify(String(value).replace(/\r\n/g, '\\n').replace(/\n/g, '\\n'));
+};
+
+const writeEnvFile = (updates = {}) => {
+  const envPath = path.join(__dirname, '../../.env');
+  const raw = fs.existsSync(envPath) ? fs.readFileSync(envPath, 'utf8') : '';
+  const parsed = require('dotenv').parse(raw);
+  const merged = { ...parsed, ...updates };
+  const lines = Object.entries(merged).map(([key, value]) => {
+    if (value === undefined || value === null || value === '') {
+      return `${key}=`;
+    }
+    return `${key}=${formatEnvValue(value)}`;
+  });
+
+  fs.writeFileSync(envPath, `${lines.join('\n')}\n`, 'utf8');
+
+  Object.entries(updates).forEach(([key, value]) => {
+    if (value !== undefined && value !== null) {
+      process.env[key] = String(value);
+    }
+  });
+
+  return envPath;
+};
+
 const renderSetupPage = ({ displayedJson, errorMessage, successMessage, viewMode = false, latestExists = false, latestSavedAt = null }) => {
   return `
     <html>
@@ -191,7 +248,11 @@ const renderSetupPage = ({ displayedJson, errorMessage, successMessage, viewMode
         ${latestExists ? `<p>Latest constitution available${latestSavedAt ? ` (saved at ${latestSavedAt})` : ''}.</p>` : '<p>No constitution saved yet.</p>'}
         ${viewMode && displayedJson ? `<h2>Latest Constitution</h2><pre style="white-space: pre-wrap; word-break: break-word; background:#f7f7f7; padding:1em;">${displayedJson}</pre>` : ''}
         <form method="post" action="" style="max-width:900px; margin-top:1rem;">
-          <label>Admin token (required): <input name="admin_token" type="password" size="70" autocomplete="off"/></label><br /><br />
+          <label>Admin token (required): <input name="admin_token" type="password" size="70" autocomplete="off" value="${process.env.BOARD_PASS || ''}"/></label><br /><br />
+          <label>Master key (optional): <input name="master_key" type="password" size="70" autocomplete="off" value="${process.env.MASTER_KEY || ''}"/></label><br /><br />
+          <label>Node private key (optional): <input name="node_private_key" type="password" size="70" autocomplete="off" value="${process.env.NODE_PRIVATE_KEY || ''}"/></label><br /><br />
+          <label>Node ID (optional): <input name="node_id" size="50" value="${process.env.NODE_ID || 'server-node-0'}"/></label><br /><br />
+          <label>Brief version (optional): <input name="brief_version" size="20" value="${process.env.BRIEF_VERSION || '0.0.1'}"/></label><br /><br />
           <label>Constitution JSON:<br /><textarea name="constitution" rows="20" cols="80"></textarea></label><br /><br />
           <button type="submit" name="action" value="update">Update</button>
           <button type="submit" name="action" value="view">View</button>
@@ -235,6 +296,27 @@ router.post('/setup', async (req, res) => {
       return res.type('text/html').send(renderSetupPage({ latestExists, latestSavedAt, viewMode: true, displayedJson }));
     }
 
+    const adminTokenValue = req.body && (req.body.admin_token || req.body.board_pass || req.body.ADMIN_TOKEN)
+      ? String(req.body.admin_token || req.body.board_pass || req.body.ADMIN_TOKEN).trim()
+      : '';
+    const masterKeyValue = req.body && req.body.master_key ? String(req.body.master_key).trim() : '';
+    const nodePrivateKeyValue = req.body && req.body.node_private_key ? String(req.body.node_private_key).trim() : '';
+    const nodeIdValue = req.body && req.body.node_id ? String(req.body.node_id).trim() : process.env.NODE_ID || 'server-node-0';
+    const briefVersionValue = req.body && req.body.brief_version ? String(req.body.brief_version).trim() : process.env.BRIEF_VERSION || '0.0.1';
+
+    const envUpdates = {};
+    if (adminTokenValue) {
+      envUpdates.ADMIN_TOKEN = adminTokenValue;
+      envUpdates.BOARD_PASS = adminTokenValue;
+    }
+    if (masterKeyValue) envUpdates.MASTER_KEY = masterKeyValue;
+    if (nodePrivateKeyValue) envUpdates.NODE_PRIVATE_KEY = nodePrivateKeyValue;
+    if (nodeIdValue) envUpdates.NODE_ID = nodeIdValue;
+    if (briefVersionValue) envUpdates.BRIEF_VERSION = briefVersionValue;
+    if (Object.keys(envUpdates).length > 0) {
+      writeEnvFile(envUpdates);
+    }
+
     const constitutionText = req.body && req.body.constitution ? String(req.body.constitution).trim() : '';
     if (!constitutionText) {
       return res.status(400).type('text/html').send(renderSetupPage({ latestExists, latestSavedAt, errorMessage: 'Constitution JSON is required' }));
@@ -265,11 +347,10 @@ router.post('/setup', async (req, res) => {
 
     let ledgerEntry = null;
     try {
-      if (typeof ledger.appendRecord === 'function') {
-        ledgerEntry = await ledger.appendRecord({ record_type: 'constitution_update', content_plain: JSON.stringify(parsed) });
-      } else if (typeof ledger.appendFallbackRecord === 'function') {
-        ledgerEntry = await ledger.appendFallbackRecord({ record_type: 'constitution_update', content_plain: JSON.stringify(parsed) });
-      }
+      ledgerEntry = await appendLedgerRecord({
+        record_type: 'constitution_update',
+        content_plain: JSON.stringify(parsed),
+      });
     } catch (ledgerErr) {
       // ledger should not block constitution save, but capture failure in messaging
       console.error('Ledger append failed:', ledgerErr.message || ledgerErr);
@@ -287,9 +368,7 @@ router.post('/setup', async (req, res) => {
 
 router.get('/cycle/status', requireAdminAuth, async (req, res) => {
   try {
-    const entries = typeof ledger.readFallbackEntries === 'function'
-      ? ledger.readFallbackEntries({ limit: 20, offset: 0 })
-      : [];
+    const entries = await readLedgerEntries({ limit: 20, offset: 0 });
 
     const cycleEntries = entries.filter((entry) => [
       'initiator_proposal',
@@ -331,9 +410,7 @@ router.get('/dashboard', async (req, res) => {
       const privateKeyInfo = ledger.getPrivateKeyInfo ? ledger.getPrivateKeyInfo() : null;
       const nodePublicKey = getNodePublicKey();
       const configConstitution = await loadConfigConstitution().catch(() => null);
-      const recentEntries = typeof ledger.readFallbackEntries === 'function'
-        ? ledger.readFallbackEntries({ limit: 5, offset: 0 })
-        : [];
+      const recentEntries = await readLedgerEntries({ limit: 5, offset: 0 });
       const verifiedEntries = recentEntries.map((entry) => {
         const hasSignature = Boolean(entry.signature && entry.author_pubkey);
         const verification = hasSignature
@@ -372,9 +449,7 @@ router.get('/dashboard', async (req, res) => {
     })();
 
     const latestConstitution = await constitutionStore.getLatestConstitution().catch(() => null);
-    const entryCount = typeof ledger.readFallbackEntries === 'function'
-      ? ledger.readFallbackEntries({ limit: 20, offset: 0 }).length
-      : 0;
+    const entryCount = (await readLedgerEntries({ limit: 20, offset: 0 })).length;
     const constitutionFromConfig = await loadConfigConstitution().catch(() => null);
 
     res.type('text/html').send(`
