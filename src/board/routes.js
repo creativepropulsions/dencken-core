@@ -422,17 +422,4 @@ router.get('/dashboard', async (req, res) => {
   }
 });
 
-/*
-          <p><strong>Node ID:</strong> ${diagData.node_id}</p>
-          <p><strong>Node type:</strong> ${diagData.node_meta.node_type || 'server'}</p>
-          <p><strong>Network:</strong> ${diagData.node_meta.network || 'dencken-network'}</p>
-          <p><strong>Brief version:</strong> ${diagData.node_meta.brief_version || '0.0.1'}</p>
-          <p><strong>Capabilities:</strong> ${Array.isArray(diagData.node_meta.capabilities) ? diagData.node_meta.capabilities.join(', ') : ''}</p>
-          <p><strong>Extensions pending:</strong> ${Array.isArray(diagData.node_meta.extensions_pending) ? diagData.node_meta.extensions_pending.join(', ') : ''}</p>
-          <p><strong>Initialized at:</strong> ${diagData.node_meta.initialized_at || 'Not set'}</p>
-          <p><strong>Node Public Key present:</strong> ${diagData.node_public_key_present}</p>
-          <p><strong>Node Public Key:</strong></p>
-          <pre style="white-space: pre-wrap; word-break: break-word;">${diagData.node_public_key || 'Not configured'}</pre>
-          */
-
 module.exports = router;
