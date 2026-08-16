@@ -9,9 +9,10 @@ const ledger = require('../core/ledger');
 const { requireAdminAuth, getAdminTokenFromRequest, getAdminToken, isAdminAuthenticated, createAdminAuthCookie, clearAdminAuthCookie } = require('./auth');
 const constitutionStore = require('../core/constitutionStore');
 const { loadConfigConstitution } = require('../core/constitutionStore');
+const { getStorageType: getConstitutionStorageType } = require('../core/constitutionStore');
 
 const readLedgerEntries = async ({ limit = 50, offset = 0 } = {}) => {
-  if (typeof ledger.getEntries === 'function' && ledger.isAvailable()) {
+  if (typeof ledger.getEntries === 'function') {
     return ledger.getEntries({ limit, offset });
   }
   if (typeof ledger.readFallbackEntries === 'function') {
@@ -84,17 +85,8 @@ router.get('/ledger', async (req, res) => {
     const limit = parseInt(req.query.limit || '50', 10);
     const offset = parseInt(req.query.offset || '0', 10);
 
-    if (typeof ledger.getEntries === 'function' && ledger.isAvailable()) {
-      const entries = await ledger.getEntries({ limit, offset });
-      return res.json({ ok: true, entries });
-    }
-
-    if (typeof ledger.readFallbackEntries === 'function') {
-      const entries = ledger.readFallbackEntries({ limit, offset });
-      return res.json({ ok: true, entries });
-    }
-
-    return res.status(500).json({ ok: false, error: 'No ledger reader available' });
+    const entries = await readLedgerEntries({ limit, offset });
+    return res.json({ ok: true, entries });
   } catch (err) {
     return res.status(500).json({ ok: false, error: err.message });
   }
@@ -397,6 +389,7 @@ router.get('/dashboard', async (req, res) => {
           <p><strong>Node Public Key:</strong></p>
           <pre style="white-space: pre-wrap; word-break: break-word;">${diagData.node_public_key || 'Not configured'}</pre>
           <p><strong>Ledger Available:</strong> ${diagData.ledger_available ? `true (${diagData.ledger_type})` : 'false'}</p>
+          <p><strong>Constitution storage:</strong> ${getConstitutionStorageType()}</p>
           <p><strong>Data directory exists:</strong> ${diagData.data_dir_exists}</p>
           <p><strong>Data directory writable:</strong> ${diagData.data_dir_writable}</p>
           <p><strong>Private key present:</strong> ${diagData.private_key_present}</p>
