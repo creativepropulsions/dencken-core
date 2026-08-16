@@ -11,7 +11,16 @@ const cookieHeaderToObject = (cookieHeader) => {
   return cookies;
 };
 
-const getAdminToken = () => process.env.ADMIN_TOKEN || process.env.MASTER_KEY || process.env.BOARD_PASS || null;
+const getAdminToken = () => {
+  const candidates = [
+    process.env.ADMIN_TOKEN,
+    process.env.BOARD_PASS,
+    process.env.MASTER_KEY,
+  ];
+
+  const token = candidates.find((value) => typeof value === 'string' && value.trim().length > 0);
+  return token ? String(token).trim() : null;
+};
 
 const getAdminTokenFromCookie = (req) => {
   const cookies = req.cookies || cookieHeaderToObject(req.headers && req.headers.cookie);

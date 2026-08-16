@@ -9,17 +9,6 @@ const ledger = require('../core/ledger');
 const { requireAdminAuth, getAdminTokenFromRequest, getAdminToken, isAdminAuthenticated, createAdminAuthCookie, clearAdminAuthCookie } = require('./auth');
 const constitutionStore = require('../core/constitutionStore');
 const { loadConfigConstitution } = require('../core/constitutionStore');
-const { getStorageType: getConstitutionStorageType } = require('../core/constitutionStore');
-
-const readLedgerEntries = async ({ limit = 50, offset = 0 } = {}) => {
-  if (typeof ledger.getEntries === 'function') {
-    return ledger.getEntries({ limit, offset });
-  }
-  if (typeof ledger.readFallbackEntries === 'function') {
-    return ledger.readFallbackEntries({ limit, offset });
-  }
-  return [];
-};
 
 router.get('/', (req, res) => {
   res.type('text/plain').send('Dencken Board Node');
@@ -80,11 +69,44 @@ router.get('/admin/logout', (req, res) => {
 });
 
 // Read ledger entries (reads fallback if sqlite not available)
+const readLedgerEntries = async ({ limit = 50, offset = 0 } = {}) => {
+  if (typeof ledger.getEntries === 'function') {
+    const sqliteEntries = await ledger.getEntries({ limit, offset });
+    if (Array.isArray(sqliteEntries) && sqliteEntries.length > 0) {
+      return sqliteEntries;
+    }
+  }
+
+  if (typeof ledger.readFallbackEntries === 'function') {
+    return ledger.readFallbackEntries({ limit, offset });
+  }
+
+  return [];
+};
+
+const appendLedgerRecord = async (opts = {}) => {
+  if (typeof ledger.appendRecord === 'function') {
+    try {
+      const entry = await ledger.appendRecord(opts);
+      if (entry) {
+        return entry;
+      }
+    } catch (err) {
+      console.warn('Unified ledger append failed, falling back to file ledger:', err.message);
+    }
+  }
+
+  if (typeof ledger.appendFallbackRecord === 'function') {
+    return ledger.appendFallbackRecord(opts);
+  }
+
+  throw new Error('No ledger appender available');
+};
+
 router.get('/ledger', async (req, res) => {
   try {
     const limit = parseInt(req.query.limit || '50', 10);
     const offset = parseInt(req.query.offset || '0', 10);
-
     const entries = await readLedgerEntries({ limit, offset });
     return res.json({ ok: true, entries });
   } catch (err) {
@@ -116,21 +138,21 @@ router.get('/ledger/test/browser', requireAdminAuth, (req, res) => {
 router.post('/ledger/test/browser', requireAdminAuth, async (req, res) => {
   try {
     const { record_type, content_plain } = req.body || {};
-    if (typeof ledger.appendRecord === 'function') {
-      const entry = await ledger.appendRecord({ record_type: record_type || 'test', content_plain: content_plain || 'test' });
-      return res.type('text/html').send(`
-        <html>
-          <head><title>Ledger Signature Test Result</title></head>
-          <body>
-            <h1>Ledger Test Result</h1>
-            <pre>${JSON.stringify(entry, null, 2)}</pre>
-            <p><a href="/ledger/test">Back</a></p>
-          </body>
-        </html>
-      `);
-    }
+    const entry = await appendLedgerRecord({
+      record_type: record_type || 'test',
+      content_plain: content_plain || 'test',
+    });
 
-    return res.status(500).json({ ok: false, error: 'No ledger append available' });
+    return res.type('text/html').send(`
+      <html>
+        <head><title>Ledger Signature Test Result</title></head>
+        <body>
+          <h1>Ledger Test Result</h1>
+          <pre>${JSON.stringify(entry, null, 2)}</pre>
+          <p><a href="/ledger/test">Back</a></p>
+        </body>
+      </html>
+    `);
   } catch (err) {
     return res.status(500).json({ ok: false, error: err.message });
   }
@@ -140,18 +162,24 @@ router.get('/diag', requireAdminAuth, (req, res) => {
   return res.redirect('/dashboard');
 });
 
-router.get('/status', (req, res) => {
-  const dataDir = path.join(__dirname, '../../data');
-  const nodePublicKey = getNodePublicKey();
-  const status = {
-    ok: true,
-    node_id: getNodeId(),
-    node_public_key_present: Boolean(nodePublicKey),
-    data_dir_exists: fs.existsSync(dataDir),
-    ledger_available: typeof ledger.isAvailable === 'function' ? ledger.isAvailable() : false,
-    timestamp: new Date().toISOString(),
-  };
-  return res.json(status);
+router.get('/status', async (req, res) => {
+  try {
+    const dataDir = path.join(__dirname, '../../data');
+    const nodePublicKey = getNodePublicKey();
+    const ledgerHeight = typeof ledger.getLedgerHeight === 'function' ? await ledger.getLedgerHeight() : 0;
+    const status = {
+      ok: true,
+      node_id: getNodeId(),
+      node_public_key_present: Boolean(nodePublicKey),
+      data_dir_exists: fs.existsSync(dataDir),
+      ledger_available: typeof ledger.isAvailable === 'function' ? ledger.isAvailable() : false,
+      ledger_height: ledgerHeight,
+      timestamp: new Date().toISOString(),
+    };
+    return res.json(status);
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err.message });
+  }
 });
 
 router.get('/cycle/test', requireAdminAuth, async (req, res) => {
@@ -181,6 +209,34 @@ router.get('/cycle/test/browser', requireAdminAuth, async (req, res) => {
   }
 });
 
+const formatEnvValue = (value) => {
+  if (value === undefined || value === null) return '';
+  return JSON.stringify(String(value).replace(/\r\n/g, '\\n').replace(/\n/g, '\\n'));
+};
+
+const writeEnvFile = (updates = {}) => {
+  const envPath = path.join(__dirname, '../../.env');
+  const raw = fs.existsSync(envPath) ? fs.readFileSync(envPath, 'utf8') : '';
+  const parsed = require('dotenv').parse(raw);
+  const merged = { ...parsed, ...updates };
+  const lines = Object.entries(merged).map(([key, value]) => {
+    if (value === undefined || value === null || value === '') {
+      return `${key}=`;
+    }
+    return `${key}=${formatEnvValue(value)}`;
+  });
+
+  fs.writeFileSync(envPath, `${lines.join('\n')}\n`, 'utf8');
+
+  Object.entries(updates).forEach(([key, value]) => {
+    if (value !== undefined && value !== null) {
+      process.env[key] = String(value);
+    }
+  });
+
+  return envPath;
+};
+
 const renderSetupPage = ({ displayedJson, errorMessage, successMessage, viewMode = false, latestExists = false, latestSavedAt = null }) => {
   return `
     <html>
@@ -192,7 +248,11 @@ const renderSetupPage = ({ displayedJson, errorMessage, successMessage, viewMode
         ${latestExists ? `<p>Latest constitution available${latestSavedAt ? ` (saved at ${latestSavedAt})` : ''}.</p>` : '<p>No constitution saved yet.</p>'}
         ${viewMode && displayedJson ? `<h2>Latest Constitution</h2><pre style="white-space: pre-wrap; word-break: break-word; background:#f7f7f7; padding:1em;">${displayedJson}</pre>` : ''}
         <form method="post" action="" style="max-width:900px; margin-top:1rem;">
-          <label>Admin token (required): <input name="admin_token" type="password" size="70" autocomplete="off"/></label><br /><br />
+          <label>Admin token (required): <input name="admin_token" type="password" size="70" autocomplete="off" value="${process.env.BOARD_PASS || ''}"/></label><br /><br />
+          <label>Master key (optional): <input name="master_key" type="password" size="70" autocomplete="off" value="${process.env.MASTER_KEY || ''}"/></label><br /><br />
+          <label>Node private key (optional): <input name="node_private_key" type="password" size="70" autocomplete="off" value="${process.env.NODE_PRIVATE_KEY || ''}"/></label><br /><br />
+          <label>Node ID (optional): <input name="node_id" size="50" value="${process.env.NODE_ID || 'server-node-0'}"/></label><br /><br />
+          <label>Brief version (optional): <input name="brief_version" size="20" value="${process.env.BRIEF_VERSION || '0.0.1'}"/></label><br /><br />
           <label>Constitution JSON:<br /><textarea name="constitution" rows="20" cols="80"></textarea></label><br /><br />
           <button type="submit" name="action" value="update">Update</button>
           <button type="submit" name="action" value="view">View</button>
@@ -236,6 +296,27 @@ router.post('/setup', async (req, res) => {
       return res.type('text/html').send(renderSetupPage({ latestExists, latestSavedAt, viewMode: true, displayedJson }));
     }
 
+    const adminTokenValue = req.body && (req.body.admin_token || req.body.board_pass || req.body.ADMIN_TOKEN)
+      ? String(req.body.admin_token || req.body.board_pass || req.body.ADMIN_TOKEN).trim()
+      : '';
+    const masterKeyValue = req.body && req.body.master_key ? String(req.body.master_key).trim() : '';
+    const nodePrivateKeyValue = req.body && req.body.node_private_key ? String(req.body.node_private_key).trim() : '';
+    const nodeIdValue = req.body && req.body.node_id ? String(req.body.node_id).trim() : process.env.NODE_ID || 'server-node-0';
+    const briefVersionValue = req.body && req.body.brief_version ? String(req.body.brief_version).trim() : process.env.BRIEF_VERSION || '0.0.1';
+
+    const envUpdates = {};
+    if (adminTokenValue) {
+      envUpdates.ADMIN_TOKEN = adminTokenValue;
+      envUpdates.BOARD_PASS = adminTokenValue;
+    }
+    if (masterKeyValue) envUpdates.MASTER_KEY = masterKeyValue;
+    if (nodePrivateKeyValue) envUpdates.NODE_PRIVATE_KEY = nodePrivateKeyValue;
+    if (nodeIdValue) envUpdates.NODE_ID = nodeIdValue;
+    if (briefVersionValue) envUpdates.BRIEF_VERSION = briefVersionValue;
+    if (Object.keys(envUpdates).length > 0) {
+      writeEnvFile(envUpdates);
+    }
+
     const constitutionText = req.body && req.body.constitution ? String(req.body.constitution).trim() : '';
     if (!constitutionText) {
       return res.status(400).type('text/html').send(renderSetupPage({ latestExists, latestSavedAt, errorMessage: 'Constitution JSON is required' }));
@@ -266,11 +347,10 @@ router.post('/setup', async (req, res) => {
 
     let ledgerEntry = null;
     try {
-      if (typeof ledger.appendRecord === 'function') {
-        ledgerEntry = await ledger.appendRecord({ record_type: 'constitution_update', content_plain: JSON.stringify(parsed) });
-      } else if (typeof ledger.appendFallbackRecord === 'function') {
-        ledgerEntry = await ledger.appendFallbackRecord({ record_type: 'constitution_update', content_plain: JSON.stringify(parsed) });
-      }
+      ledgerEntry = await appendLedgerRecord({
+        record_type: 'constitution_update',
+        content_plain: JSON.stringify(parsed),
+      });
     } catch (ledgerErr) {
       // ledger should not block constitution save, but capture failure in messaging
       console.error('Ledger append failed:', ledgerErr.message || ledgerErr);
@@ -329,7 +409,6 @@ router.get('/dashboard', async (req, res) => {
       const tmpFile = path.join(dataDir, `.diag-${Date.now()}.tmp`);
       const privateKeyInfo = ledger.getPrivateKeyInfo ? ledger.getPrivateKeyInfo() : null;
       const nodePublicKey = getNodePublicKey();
-      const nodeMeta = getNodeMeta();
       const configConstitution = await loadConfigConstitution().catch(() => null);
       const recentEntries = await readLedgerEntries({ limit: 5, offset: 0 });
       const verifiedEntries = recentEntries.map((entry) => {
@@ -340,10 +419,10 @@ router.get('/dashboard', async (req, res) => {
         return { entry, verification, hasSignature };
       });
       const result = {
-        node_id: getNodeId(),
-        node_meta: nodeMeta,
-        node_public_key: nodePublicKey,
-        node_public_key_present: Boolean(nodePublicKey),
+        //node_id: getNodeId(),
+        //node_meta: nodeMeta,
+        //node_public_key: nodePublicKey,
+        //node_public_key_present: Boolean(nodePublicKey),
         ledger_module_loaded: typeof ledger !== 'undefined',
         ledger_available: typeof ledger.isAvailable === 'function' ? ledger.isAvailable() : false,
         ledger_type: typeof ledger.ledgerType === 'function' ? ledger.ledgerType() : 'unknown',
@@ -370,26 +449,14 @@ router.get('/dashboard', async (req, res) => {
     })();
 
     const latestConstitution = await constitutionStore.getLatestConstitution().catch(() => null);
-    const entryCount = (await readLedgerEntries({ limit: 1000, offset: 0 })).length;
+    const entryCount = (await readLedgerEntries({ limit: 20, offset: 0 })).length;
     const constitutionFromConfig = await loadConfigConstitution().catch(() => null);
 
     res.type('text/html').send(`
       <html>
         <head><title>Dencken Dashboard</title></head>
         <body>
-          <h1>Dencken Admin Dashboard</h1>
-          <p><strong>Node ID:</strong> ${diagData.node_id}</p>
-          <p><strong>Node type:</strong> ${diagData.node_meta.node_type || 'server'}</p>
-          <p><strong>Network:</strong> ${diagData.node_meta.network || 'dencken-network'}</p>
-          <p><strong>Brief version:</strong> ${diagData.node_meta.brief_version || '0.0.1'}</p>
-          <p><strong>Capabilities:</strong> ${Array.isArray(diagData.node_meta.capabilities) ? diagData.node_meta.capabilities.join(', ') : ''}</p>
-          <p><strong>Extensions pending:</strong> ${Array.isArray(diagData.node_meta.extensions_pending) ? diagData.node_meta.extensions_pending.join(', ') : ''}</p>
-          <p><strong>Initialized at:</strong> ${diagData.node_meta.initialized_at || 'Not set'}</p>
-          <p><strong>Node Public Key present:</strong> ${diagData.node_public_key_present}</p>
-          <p><strong>Node Public Key:</strong></p>
-          <pre style="white-space: pre-wrap; word-break: break-word;">${diagData.node_public_key || 'Not configured'}</pre>
-          <p><strong>Ledger Available:</strong> ${diagData.ledger_available ? `true (${diagData.ledger_type})` : 'false'}</p>
-          <p><strong>Constitution storage:</strong> ${getConstitutionStorageType()}</p>
+          <h1>Dencken Admin Dashboard</h1><p><strong>Ledger Available:</strong> ${diagData.ledger_available ? `true (${diagData.ledger_type})` : 'false'}</p>
           <p><strong>Data directory exists:</strong> ${diagData.data_dir_exists}</p>
           <p><strong>Data directory writable:</strong> ${diagData.data_dir_writable}</p>
           <p><strong>Private key present:</strong> ${diagData.private_key_present}</p>
