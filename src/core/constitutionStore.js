@@ -196,11 +196,6 @@ const storeConstitution = async ({ constitution }) => {
   }
 };
 
-const getStorageType = () => {
-  if (available) return 'sqlite';
-  return 'jsonl';
-};
-
 init();
 
-module.exports = { getLatestConstitution, storeConstitution, loadConfigConstitution, getStorageType };
+module.exports = { getLatestConstitution, storeConstitution, loadConfigConstitution };

@@ -9,17 +9,6 @@ const ledger = require('../core/ledger');
 const { requireAdminAuth, getAdminTokenFromRequest, getAdminToken, isAdminAuthenticated, createAdminAuthCookie, clearAdminAuthCookie } = require('./auth');
 const constitutionStore = require('../core/constitutionStore');
 const { loadConfigConstitution } = require('../core/constitutionStore');
-const { getStorageType: getConstitutionStorageType } = require('../core/constitutionStore');
-
-const readLedgerEntries = async ({ limit = 50, offset = 0 } = {}) => {
-  if (typeof ledger.getEntries === 'function') {
-    return ledger.getEntries({ limit, offset });
-  }
-  if (typeof ledger.readFallbackEntries === 'function') {
-    return ledger.readFallbackEntries({ limit, offset });
-  }
-  return [];
-};
 
 router.get('/', (req, res) => {
   res.type('text/plain').send('Dencken Board Node');
@@ -85,8 +74,18 @@ router.get('/ledger', async (req, res) => {
     const limit = parseInt(req.query.limit || '50', 10);
     const offset = parseInt(req.query.offset || '0', 10);
 
-    const entries = await readLedgerEntries({ limit, offset });
-    return res.json({ ok: true, entries });
+    if (typeof ledger.readFallbackEntries === 'function') {
+      const entries = ledger.readFallbackEntries({ limit, offset });
+      return res.json({ ok: true, entries });
+    }
+
+    // if sqlite available, use getEntries
+    if (typeof ledger.getEntries === 'function') {
+      const entries = await ledger.getEntries({ limit, offset });
+      return res.json({ ok: true, entries });
+    }
+
+    return res.status(500).json({ ok: false, error: 'No ledger reader available' });
   } catch (err) {
     return res.status(500).json({ ok: false, error: err.message });
   }
@@ -116,8 +115,8 @@ router.get('/ledger/test/browser', requireAdminAuth, (req, res) => {
 router.post('/ledger/test/browser', requireAdminAuth, async (req, res) => {
   try {
     const { record_type, content_plain } = req.body || {};
-    if (typeof ledger.appendRecord === 'function') {
-      const entry = await ledger.appendRecord({ record_type: record_type || 'test', content_plain: content_plain || 'test' });
+    if (typeof ledger.appendFallbackRecord === 'function') {
+      const entry = await ledger.appendFallbackRecord({ record_type: record_type || 'test', content_plain: content_plain || 'test' });
       return res.type('text/html').send(`
         <html>
           <head><title>Ledger Signature Test Result</title></head>
@@ -130,7 +129,7 @@ router.post('/ledger/test/browser', requireAdminAuth, async (req, res) => {
       `);
     }
 
-    return res.status(500).json({ ok: false, error: 'No ledger append available' });
+    return res.status(500).json({ ok: false, error: 'No fallback ledger available' });
   } catch (err) {
     return res.status(500).json({ ok: false, error: err.message });
   }
@@ -288,7 +287,9 @@ router.post('/setup', async (req, res) => {
 
 router.get('/cycle/status', requireAdminAuth, async (req, res) => {
   try {
-    const entries = await readLedgerEntries({ limit: 20, offset: 0 });
+    const entries = typeof ledger.readFallbackEntries === 'function'
+      ? ledger.readFallbackEntries({ limit: 20, offset: 0 })
+      : [];
 
     const cycleEntries = entries.filter((entry) => [
       'initiator_proposal',
@@ -329,9 +330,10 @@ router.get('/dashboard', async (req, res) => {
       const tmpFile = path.join(dataDir, `.diag-${Date.now()}.tmp`);
       const privateKeyInfo = ledger.getPrivateKeyInfo ? ledger.getPrivateKeyInfo() : null;
       const nodePublicKey = getNodePublicKey();
-      const nodeMeta = getNodeMeta();
       const configConstitution = await loadConfigConstitution().catch(() => null);
-      const recentEntries = await readLedgerEntries({ limit: 5, offset: 0 });
+      const recentEntries = typeof ledger.readFallbackEntries === 'function'
+        ? ledger.readFallbackEntries({ limit: 5, offset: 0 })
+        : [];
       const verifiedEntries = recentEntries.map((entry) => {
         const hasSignature = Boolean(entry.signature && entry.author_pubkey);
         const verification = hasSignature
@@ -340,10 +342,10 @@ router.get('/dashboard', async (req, res) => {
         return { entry, verification, hasSignature };
       });
       const result = {
-        node_id: getNodeId(),
-        node_meta: nodeMeta,
-        node_public_key: nodePublicKey,
-        node_public_key_present: Boolean(nodePublicKey),
+        //node_id: getNodeId(),
+        //node_meta: nodeMeta,
+        //node_public_key: nodePublicKey,
+        //node_public_key_present: Boolean(nodePublicKey),
         ledger_module_loaded: typeof ledger !== 'undefined',
         ledger_available: typeof ledger.isAvailable === 'function' ? ledger.isAvailable() : false,
         ledger_type: typeof ledger.ledgerType === 'function' ? ledger.ledgerType() : 'unknown',
@@ -370,26 +372,16 @@ router.get('/dashboard', async (req, res) => {
     })();
 
     const latestConstitution = await constitutionStore.getLatestConstitution().catch(() => null);
-    const entryCount = (await readLedgerEntries({ limit: 1000, offset: 0 })).length;
+    const entryCount = typeof ledger.readFallbackEntries === 'function'
+      ? ledger.readFallbackEntries({ limit: 20, offset: 0 }).length
+      : 0;
     const constitutionFromConfig = await loadConfigConstitution().catch(() => null);
 
     res.type('text/html').send(`
       <html>
         <head><title>Dencken Dashboard</title></head>
         <body>
-          <h1>Dencken Admin Dashboard</h1>
-          <p><strong>Node ID:</strong> ${diagData.node_id}</p>
-          <p><strong>Node type:</strong> ${diagData.node_meta.node_type || 'server'}</p>
-          <p><strong>Network:</strong> ${diagData.node_meta.network || 'dencken-network'}</p>
-          <p><strong>Brief version:</strong> ${diagData.node_meta.brief_version || '0.0.1'}</p>
-          <p><strong>Capabilities:</strong> ${Array.isArray(diagData.node_meta.capabilities) ? diagData.node_meta.capabilities.join(', ') : ''}</p>
-          <p><strong>Extensions pending:</strong> ${Array.isArray(diagData.node_meta.extensions_pending) ? diagData.node_meta.extensions_pending.join(', ') : ''}</p>
-          <p><strong>Initialized at:</strong> ${diagData.node_meta.initialized_at || 'Not set'}</p>
-          <p><strong>Node Public Key present:</strong> ${diagData.node_public_key_present}</p>
-          <p><strong>Node Public Key:</strong></p>
-          <pre style="white-space: pre-wrap; word-break: break-word;">${diagData.node_public_key || 'Not configured'}</pre>
-          <p><strong>Ledger Available:</strong> ${diagData.ledger_available ? `true (${diagData.ledger_type})` : 'false'}</p>
-          <p><strong>Constitution storage:</strong> ${getConstitutionStorageType()}</p>
+          <h1>Dencken Admin Dashboard</h1><p><strong>Ledger Available:</strong> ${diagData.ledger_available ? `true (${diagData.ledger_type})` : 'false'}</p>
           <p><strong>Data directory exists:</strong> ${diagData.data_dir_exists}</p>
           <p><strong>Data directory writable:</strong> ${diagData.data_dir_writable}</p>
           <p><strong>Private key present:</strong> ${diagData.private_key_present}</p>

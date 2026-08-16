@@ -125,42 +125,44 @@ const isAvailable = () => available || fallbackAvailable();
 
 const ledgerType = () => {
   if (available) return 'sqlite';
-  if (fallbackAvailable()) return 'jsonl';
+  if (fallbackAvailable()) return 'sqlite fallback';
   return 'unavailable';
 };
 
-const getLedgerHeight = async () => {
-  if (available && db) {
-    return new Promise((resolve) => {
-      db.get('SELECT COUNT(*) AS count FROM ledger_entries', (err, row) => {
-        if (err) {
-          console.error('Failed to query ledger height:', err.message);
-          return resolve(readFallbackEntries({ limit: 100000 }).length);
-        }
-        resolve(row ? row.count : 0);
-      });
+const getLedgerHeight = () => {
+  return new Promise((resolve, reject) => {
+    if (!available || !db) {
+      return resolve(0);
+    }
+
+    db.get('SELECT COUNT(*) AS count FROM ledger_entries', (err, row) => {
+      if (err) {
+        console.error('Failed to query ledger height:', err.message);
+        return resolve(0);
+      }
+      resolve(row ? row.count : 0);
     });
-  }
-  return readFallbackEntries({ limit: 100000 }).length;
+  });
 };
 
-const getEntries = async ({ limit = 50, offset = 0 } = {}) => {
-  if (available && db) {
-    return new Promise((resolve) => {
-      db.all(
-        'SELECT * FROM ledger_entries ORDER BY created_at DESC LIMIT ? OFFSET ?',
-        [limit, offset],
-        (err, rows) => {
-          if (err) {
-            console.error('Failed to read ledger entries:', err.message);
-            return resolve(readFallbackEntries({ limit, offset }));
-          }
-          resolve(rows);
+const getEntries = ({ limit = 50, offset = 0 } = {}) => {
+  return new Promise((resolve, reject) => {
+    if (!available || !db) {
+      return resolve([]);
+    }
+
+    db.all(
+      'SELECT * FROM ledger_entries ORDER BY created_at DESC LIMIT ? OFFSET ?',
+      [limit, offset],
+      (err, rows) => {
+        if (err) {
+          console.error('Failed to read ledger entries:', err.message);
+          return resolve([]);
         }
-      );
-    });
-  }
-  return readFallbackEntries({ limit, offset });
+        resolve(rows);
+      }
+    );
+  });
 };
 
 // JSON-file fallback ledger implementation
@@ -391,34 +393,11 @@ module.exports.appendFallbackRecord = appendFallbackRecord;
 module.exports.readFallbackEntries = readFallbackEntries;
 module.exports.verifyEntrySignature = verifyEntrySignature;
 module.exports.getPrivateKeyInfo = getPrivateKeyInfo;
-module.exports.getEntries = getEntries;
-module.exports.getLedgerHeight = getLedgerHeight;
 // appendRecord: unified append used by application code. Chooses sqlite path if available else fallback
-const getPrevHash = () => {
-  try {
-    if (fs.existsSync(fallbackPath)) {
-      const stat = fs.statSync(fallbackPath);
-      if (stat.size > 0) {
-        const data = fs.readFileSync(fallbackPath, 'utf8');
-        const lines = data.trim().split(/\r?\n/);
-        const last = lines[lines.length - 1];
-        if (last) {
-          try {
-            const lastObj = JSON.parse(last);
-            return lastObj.content_hash || null;
-          } catch (e) {
-            return null;
-          }
-        }
-      }
-    }
-  } catch (e) {}
-  return null;
-};
-
 const appendRecord = async (opts = {}) => {
+  // If sqlite is available, insert via db
   if (available && db) {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       const id = uuid();
       const created_at = new Date().toISOString();
       const record_type = opts.record_type || 'system';
@@ -427,6 +406,7 @@ const appendRecord = async (opts = {}) => {
       const content_hash = crypto.createHash('sha256').update(content_plain).digest('hex');
       const content_encrypted = Buffer.from(content_plain, 'utf8').toString('base64');
 
+      // attempt to sign using available private key
       let signature = null;
       let author_pubkey = null;
       try {
@@ -441,7 +421,7 @@ const appendRecord = async (opts = {}) => {
         author_pubkey = null;
       }
 
-      const prev_hash = getPrevHash();
+      const prev_hash = null;
       const status = 'pending_review';
 
       const sql = `INSERT INTO ledger_entries (id, created_at, record_type, brief_version, content_hash, content_encrypted, author_pubkey, signature, prev_hash, status, board_note) VALUES (?,?,?,?,?,?,?,?,?,?,?)`;
@@ -452,6 +432,7 @@ const appendRecord = async (opts = {}) => {
     });
   }
 
+  // otherwise fallback to file-based append
   return appendFallbackRecord(opts);
 };
 
