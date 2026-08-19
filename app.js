@@ -1,4 +1,4 @@
-﻿// app.js
+// app.js
 const path = require('path');
 const dotenv = require('dotenv');
 const createBoardServer = require('./src/board/server');
