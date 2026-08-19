@@ -211,7 +211,8 @@ router.get('/cycle/test/browser', requireAdminAuth, async (req, res) => {
 
 const formatEnvValue = (value) => {
   if (value === undefined || value === null) return '';
-  return JSON.stringify(String(value).replace(/\r\n/g, '\\n').replace(/\n/g, '\\n'));
+  const str = String(value).replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  return JSON.stringify(str);
 };
 
 const writeEnvFile = (updates = {}) => {
