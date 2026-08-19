@@ -250,7 +250,7 @@ const renderSetupPage = ({ displayedJson, errorMessage, successMessage, viewMode
         <form method="post" action="" style="max-width:900px; margin-top:1rem;">
           <label>Admin token (required): <input name="admin_token" type="password" size="70" autocomplete="off" value="${process.env.BOARD_PASS || ''}"/></label><br /><br />
           <label>Master key (optional): <input name="master_key" type="password" size="70" autocomplete="off" value="${process.env.MASTER_KEY || ''}"/></label><br /><br />
-          <label>Node private key (optional): <input name="node_private_key" type="password" size="70" autocomplete="off" value="${process.env.NODE_PRIVATE_KEY || ''}"/></label><br /><br />
+          <label>Node private key (required): <input name="node_private_key" type="password" size="70" autocomplete="off" value="${process.env.NODE_PRIVATE_KEY || ''}" required/></label><br /><br />
           <label>Node ID (optional): <input name="node_id" size="50" value="${process.env.NODE_ID || 'server-node-0'}"/></label><br /><br />
           <label>Brief version (optional): <input name="brief_version" size="20" value="${process.env.BRIEF_VERSION || '0.0.1'}"/></label><br /><br />
           <label>Constitution JSON:<br /><textarea name="constitution" rows="20" cols="80"></textarea></label><br /><br />
@@ -304,13 +304,17 @@ router.post('/setup', async (req, res) => {
     const nodeIdValue = req.body && req.body.node_id ? String(req.body.node_id).trim() : process.env.NODE_ID || 'server-node-0';
     const briefVersionValue = req.body && req.body.brief_version ? String(req.body.brief_version).trim() : process.env.BRIEF_VERSION || '0.0.1';
 
+    if (!nodePrivateKeyValue) {
+      return res.status(400).type('text/html').send(renderSetupPage({ latestExists, latestSavedAt, errorMessage: 'Node private key is required for signed ledger entries' }));
+    }
+
     const envUpdates = {};
     if (adminTokenValue) {
       envUpdates.ADMIN_TOKEN = adminTokenValue;
       envUpdates.BOARD_PASS = adminTokenValue;
     }
     if (masterKeyValue) envUpdates.MASTER_KEY = masterKeyValue;
-    if (nodePrivateKeyValue) envUpdates.NODE_PRIVATE_KEY = nodePrivateKeyValue;
+    envUpdates.NODE_PRIVATE_KEY = nodePrivateKeyValue;
     if (nodeIdValue) envUpdates.NODE_ID = nodeIdValue;
     if (briefVersionValue) envUpdates.BRIEF_VERSION = briefVersionValue;
     if (Object.keys(envUpdates).length > 0) {
