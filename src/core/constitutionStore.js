@@ -1,60 +1,61 @@
-const fs = require('fs');
 const path = require('path');
+const fs = require('fs');
 const crypto = require('crypto');
-let sqlite3;
+const https = require('https');
 
-try {
-  sqlite3 = require('sqlite3').verbose();
-} catch (err) {
-  sqlite3 = null;
-}
-
-const dataDir = path.join(__dirname, '../../data');
-const dbPath = path.join(dataDir, 'constitution_simple.db');
-const fallbackPath = path.join(dataDir, 'constitution_simple.jsonl');
 const configConstitutionPath = path.join(__dirname, '../../config/constitution.json.enc');
-
-let db = null;
-let available = false;
-
-const init = () => {
-  if (!sqlite3) {
-    available = false;
-    return;
-  }
-
-  try {
-    if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
-    db = new sqlite3.Database(dbPath, (err) => {
-      if (err) {
-        available = false;
-        db = null;
-        return;
-      }
-      const sql = `
-        CREATE TABLE IF NOT EXISTS constitution_records (
-          id TEXT PRIMARY KEY,
-          created_at TEXT NOT NULL,
-          content_hash TEXT NOT NULL,
-          content_plain TEXT NOT NULL,
-          prev_hash TEXT,
-          status TEXT,
-          board_note TEXT
-        );
-      `;
-      db.run(sql, (e) => {
-        if (e) { available = false; db = null; return; }
-        available = true;
-      });
-    });
-  } catch (err) {
-    available = false;
-    db = null;
-  }
-};
 
 const uuid = (typeof crypto.randomUUID === 'function') ? crypto.randomUUID : () => {
   return ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g, c => (c ^ crypto.randomBytes(1)[0] & 15 >> c / 4).toString(16));
+};
+
+const getSupabaseConfig = () => {
+  const url = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
+  const key = process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY;
+  return { url, key, available: Boolean(url && key) };
+};
+
+const supabaseRequest = (method, tablePath, body = null) => {
+  return new Promise((resolve, reject) => {
+    const { url, key, available } = getSupabaseConfig();
+    if (!available) return reject(new Error('Supabase not configured'));
+
+    const parsed = new URL(url + '/rest/v1/' + tablePath);
+    const headers = {
+      'apikey': key,
+      'Authorization': 'Bearer ' + key,
+      'Content-Type': 'application/json',
+      'Prefer': method === 'POST' ? 'return=representation' : 'count=exact',
+    };
+    if (method === 'POST') headers['Prefer'] = 'return=representation';
+
+    const options = {
+      hostname: parsed.hostname,
+      path: parsed.pathname + parsed.search,
+      method,
+      headers,
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', (d) => data += d);
+      res.on('end', () => {
+        try {
+          const json = data ? JSON.parse(data) : null;
+          if (res.statusCode >= 400) {
+            return reject(new Error(json && json.message ? json.message : `HTTP ${res.statusCode}`));
+          }
+          resolve({ data: json, count: res.headers['content-range'] || null });
+        } catch (e) {
+          if (res.statusCode >= 400) return reject(new Error(`HTTP ${res.statusCode}: ${data}`));
+          resolve({ data: null, count: null });
+        }
+      });
+    });
+    req.on('error', reject);
+    if (body) req.write(JSON.stringify(body));
+    req.end();
+  });
 };
 
 const getConstitutionKey = () => process.env.CONSTITUTION_KEY || null;
@@ -95,38 +96,26 @@ const decryptConstitution = (encrypted) => {
 };
 
 const saveConfigConstitution = (encryptedContent) => {
-  const configDir = path.dirname(configConstitutionPath);
-  if (!fs.existsSync(configDir)) {
-    fs.mkdirSync(configDir, { recursive: true });
-  }
-  fs.writeFileSync(configConstitutionPath, encryptedContent, 'utf8');
-};
-
-const getLatestFallbackRecord = () => {
-  if (!fs.existsSync(fallbackPath)) return null;
-  const data = fs.readFileSync(fallbackPath, 'utf8').trim();
-  if (!data) return null;
-  const lines = data.split(/\r?\n/).filter(Boolean);
-  const last = lines[lines.length - 1];
-  if (!last) return null;
-  try { return JSON.parse(last); } catch (err) { return null; }
-};
-
-const getLatestRecord = () => {
-  if (available && db) {
-    try {
-      const sql = 'SELECT * FROM constitution_records ORDER BY created_at DESC LIMIT 1';
-      return new Promise((resolve) => {
-        db.get(sql, (err, row) => {
-          if (err || !row) return resolve(null);
-          resolve(row);
-        });
-      });
-    } catch (err) {
-      return null;
+  try {
+    const configDir = path.dirname(configConstitutionPath);
+    if (!fs.existsSync(configDir)) {
+      fs.mkdirSync(configDir, { recursive: true });
     }
+    fs.writeFileSync(configConstitutionPath, encryptedContent, 'utf8');
+  } catch (err) {
+    // File system may not persist in this environment; ignore
   }
-  return getLatestFallbackRecord();
+};
+
+const getLatestRecord = async () => {
+  if (!getSupabaseConfig().available) return null;
+  try {
+    const result = await supabaseRequest('GET', 'constitution_records?order=created_at.desc&limit=1');
+    return (result.data && result.data.length > 0) ? result.data[0] : null;
+  } catch (err) {
+    console.error('Failed to read latest constitution from Supabase:', err.message);
+    return null;
+  }
 };
 
 const loadConfigConstitution = async () => {
@@ -174,28 +163,13 @@ const storeConstitution = async ({ constitution }) => {
     board_note: null,
   };
 
-  if (available && db) {
-    const promise = new Promise((resolve, reject) => {
-      const sql = `INSERT INTO constitution_records (id, created_at, content_hash, content_plain, prev_hash, status, board_note) VALUES (?,?,?,?,?,?,?)`;
-      db.run(sql, [record.id, record.created_at, record.content_hash, record.content_plain, record.prev_hash, record.status, record.board_note], function (err) {
-        if (err) return reject(new Error('Failed to store constitution: ' + err.message));
-        resolve(record);
-      });
-    });
-    saveConfigConstitution(encryptedContent);
-    return promise;
-  }
-
   try {
-    if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
-    fs.appendFileSync(fallbackPath, JSON.stringify(record) + '\n', { encoding: 'utf8' });
+    await supabaseRequest('POST', 'constitution_records', record);
     saveConfigConstitution(encryptedContent);
     return record;
   } catch (err) {
-    throw new Error('Failed to store constitution record: ' + err.message);
+    throw new Error('Failed to store constitution: ' + err.message);
   }
 };
-
-init();
 
 module.exports = { getLatestConstitution, storeConstitution, loadConfigConstitution };

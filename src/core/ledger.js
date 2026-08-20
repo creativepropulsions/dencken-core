@@ -1,75 +1,81 @@
 const path = require('path');
 const fs = require('fs');
-let sqlite3;
-
-try {
-  sqlite3 = require('sqlite3').verbose();
-} catch (err) {
-  // sqlite3 may not be available in all hosting environments
-  sqlite3 = null;
-}
+const crypto = require('crypto');
+const https = require('https');
 
 const dataDir = path.join(__dirname, '../../data');
-const dbPath = path.join(dataDir, 'ledger.db');
+const fallbackPath = path.join(dataDir, 'ledger.jsonl');
 
-let db = null;
-let available = false;
+const uuid = (typeof crypto.randomUUID === 'function') ? crypto.randomUUID : () => {
+  return ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g, c => (c ^ crypto.randomBytes(1)[0] & 15 >> c / 4).toString(16));
+};
 
-const initLedger = () => {
-  if (!sqlite3) {
-    console.warn('sqlite3 not installed; ledger disabled');
-    available = false;
-    return;
-  }
+const getSupabaseConfig = () => {
+  const url = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
+  const key = process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY;
+  return { url, key, available: Boolean(url && key) };
+};
 
+const supabaseRequest = (method, tablePath, body = null) => {
+  return new Promise((resolve, reject) => {
+    const { url, key, available } = getSupabaseConfig();
+    if (!available) return reject(new Error('Supabase not configured'));
+
+    const parsed = new URL(url + '/rest/v1/' + tablePath);
+    const headers = {
+      'apikey': key,
+      'Authorization': 'Bearer ' + key,
+      'Content-Type': 'application/json',
+    };
+    if (method === 'POST') headers['Prefer'] = 'return=representation';
+
+    const options = {
+      hostname: parsed.hostname,
+      path: parsed.pathname + parsed.search,
+      method,
+      headers,
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', (d) => data += d);
+      res.on('end', () => {
+        try {
+          const json = data ? JSON.parse(data) : null;
+          if (res.statusCode >= 400) {
+            return reject(new Error(json && json.message ? json.message : `HTTP ${res.statusCode}`));
+          }
+          const countHeader = res.headers['content-range'];
+          let count = null;
+          if (countHeader && countHeader.startsWith('*/')) {
+            count = parseInt(countHeader.substring(2), 10);
+          }
+          resolve({ data: json, count });
+        } catch (e) {
+          if (res.statusCode >= 400) return reject(new Error(`HTTP ${res.statusCode}: ${data}`));
+          resolve({ data: null, count: null });
+        }
+      });
+    });
+    req.on('error', reject);
+    if (body) req.write(JSON.stringify(body));
+    req.end();
+  });
+};
+
+const ensureFallbackLedgerReady = () => {
   try {
     if (!fs.existsSync(dataDir)) {
       fs.mkdirSync(dataDir, { recursive: true });
     }
-
-    db = new sqlite3.Database(dbPath, (err) => {
-      if (err) {
-        console.error('Failed to open ledger database:', err.message);
-        available = false;
-        db = null;
-        return;
-      }
-
-      const sql = `
-        CREATE TABLE IF NOT EXISTS ledger_entries (
-          id TEXT PRIMARY KEY,
-          created_at TEXT NOT NULL,
-          record_type TEXT NOT NULL,
-          brief_version TEXT,
-          content_hash TEXT,
-          content_encrypted TEXT,
-          author_pubkey TEXT,
-          signature TEXT,
-          prev_hash TEXT,
-          status TEXT,
-          board_note TEXT
-        );
-      `;
-
-      db.run(sql, (err2) => {
-        if (err2) {
-          console.error('Failed to initialize ledger schema:', err2.message);
-          available = false;
-          db = null;
-          return;
-        }
-        available = true;
-      });
-    });
+    if (!fs.existsSync(fallbackPath)) {
+      fs.writeFileSync(fallbackPath, '', 'utf8');
+    }
+    return true;
   } catch (err) {
-    console.error('Ledger initialization error:', err.message);
-    available = false;
-    db = null;
+    return false;
   }
 };
-
-// Attempt to initialize ledger but do not throw on failure.
-initLedger();
 
 const fallbackAvailable = () => {
   try {
@@ -83,122 +89,65 @@ const fallbackAvailable = () => {
   }
 };
 
+const isAvailable = () => getSupabaseConfig().available || fallbackAvailable();
+
+const ledgerType = () => {
+  if (getSupabaseConfig().available) return 'supabase';
+  if (fallbackAvailable()) return 'file fallback';
+  return 'unavailable';
+};
+
 const cleanupLedgerFiles = () => {
-  const filesToRemove = [dbPath, `${dbPath}-shm`, `${dbPath}-wal`];
-  for (const filePathToRemove of filesToRemove) {
-    try {
-      if (fs.existsSync(filePathToRemove)) {
-        fs.unlinkSync(filePathToRemove);
-      }
-    } catch (err) {
-      console.error('Failed to remove ledger file:', filePathToRemove, err.message);
-    }
+  try {
+    if (fs.existsSync(fallbackPath)) fs.unlinkSync(fallbackPath);
+  } catch (err) {
+    // ignore
   }
 };
 
 const resetLedgerStorage = async () => {
-  return new Promise((resolve) => {
-    const finalizeReset = () => {
-      db = null;
-      available = false;
-      cleanupLedgerFiles();
-      initLedger();
-      resolve(true);
-    };
-
-    if (db) {
-      db.close((err) => {
-        if (err) {
-          console.error('Failed to close ledger DB during reset:', err.message);
-        }
-        finalizeReset();
-      });
-    } else {
-      finalizeReset();
-    }
-  });
-};
-
-const isAvailable = () => available || fallbackAvailable();
-
-const ledgerType = () => {
-  if (available) return 'sqlite';
-  if (fallbackAvailable()) return 'sqlite fallback';
-  return 'unavailable';
-};
-
-const getLedgerHeight = () => {
-  return new Promise((resolve, reject) => {
-    if (available && db) {
-      return db.get('SELECT COUNT(*) AS count FROM ledger_entries', (err, row) => {
-        if (err) {
-          console.error('Failed to query ledger height:', err.message);
-          return resolve(0);
-        }
-        return resolve(row ? row.count : 0);
-      });
-    }
-
+  if (getSupabaseConfig().available) {
     try {
-      if (!fs.existsSync(fallbackPath)) {
-        return resolve(0);
-      }
-
-      const data = fs.readFileSync(fallbackPath, 'utf8').trim();
-      if (!data) {
-        return resolve(0);
-      }
-
-      const lines = data.split(/\r?\n/).filter(Boolean);
-      return resolve(lines.length);
+      await supabaseRequest('DELETE', 'ledger_entries?id=neq.0');
     } catch (err) {
-      console.error('Failed to read fallback ledger height:', err.message);
-      return resolve(0);
+      console.error('Failed to clear ledger in Supabase:', err.message);
     }
-  });
-};
-
-const getEntries = ({ limit = 50, offset = 0 } = {}) => {
-  return new Promise((resolve, reject) => {
-    if (!available || !db) {
-      return resolve([]);
-    }
-
-    db.all(
-      'SELECT * FROM ledger_entries ORDER BY created_at DESC LIMIT ? OFFSET ?',
-      [limit, offset],
-      (err, rows) => {
-        if (err) {
-          console.error('Failed to read ledger entries:', err.message);
-          return resolve([]);
-        }
-        resolve(rows);
-      }
-    );
-  });
-};
-
-// JSON-file fallback ledger implementation
-const crypto = require('crypto');
-const uuid = (typeof crypto.randomUUID === 'function') ? crypto.randomUUID : () => {
-  return ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g, c => (c ^ crypto.randomBytes(1)[0] & 15 >> c / 4).toString(16));
-};
-
-const fallbackPath = path.join(dataDir, 'ledger.jsonl');
-
-const ensureFallbackLedgerReady = () => {
-  try {
-    if (!fs.existsSync(dataDir)) {
-      fs.mkdirSync(dataDir, { recursive: true });
-    }
-    if (!fs.existsSync(fallbackPath)) {
-      fs.writeFileSync(fallbackPath, '', 'utf8');
-    }
-    return true;
-  } catch (err) {
-    console.error('Failed to initialize ledger fallback storage:', err.message);
-    return false;
   }
+  cleanupLedgerFiles();
+  ensureFallbackLedgerReady();
+  return true;
+};
+
+const getLedgerHeight = async () => {
+  if (getSupabaseConfig().available) {
+    try {
+      const result = await supabaseRequest('GET', 'ledger_entries?select=id&limit=1000');
+      return (result.data || []).length;
+    } catch (err) {
+      console.error('Failed to query ledger height from Supabase:', err.message);
+    }
+  }
+
+  try {
+    if (!fs.existsSync(fallbackPath)) return 0;
+    const data = fs.readFileSync(fallbackPath, 'utf8').trim();
+    if (!data) return 0;
+    return data.split(/\r?\n/).filter(Boolean).length;
+  } catch (err) {
+    return 0;
+  }
+};
+
+const getEntries = async ({ limit = 50, offset = 0 } = {}) => {
+  if (getSupabaseConfig().available) {
+    try {
+      const result = await supabaseRequest('GET', `ledger_entries?order=created_at.desc&limit=${limit}&offset=${offset}`);
+      return result.data || [];
+    } catch (err) {
+      console.error('Failed to read ledger entries from Supabase:', err.message);
+    }
+  }
+  return readFallbackEntries({ limit, offset });
 };
 
 const normalizePem = (rawPem) => {
@@ -296,8 +245,37 @@ const getPublicKeyPemFromPrivate = (keyObject) => {
   }
 };
 
+const signEntry = (content_hash) => {
+  let signature = null;
+  let author_pubkey = null;
+  const privateInfo = getPrivateKeyInfo();
+  if (privateInfo && privateInfo.private_key_present && privateInfo.private_key_valid && privateInfo.keyObject) {
+    try {
+      const sign = crypto.sign(null, String(content_hash), privateInfo.keyObject);
+      signature = sign.toString('base64');
+      author_pubkey = getPublicKeyPemFromPrivate(privateInfo.keyObject) || null;
+    } catch (err) {
+      signature = null;
+      author_pubkey = null;
+    }
+  }
+
+  if (!author_pubkey && signature) {
+    const envPubKey = getEnvNodePublicKey();
+    author_pubkey = envPubKey ? envPubKey.trim() : null;
+  }
+
+  if (!author_pubkey && signature) {
+    const pubKeyPath = path.join(__dirname, '../../config/node-identity.pub');
+    if (fs.existsSync(pubKeyPath)) {
+      author_pubkey = fs.readFileSync(pubKeyPath, 'utf8').trim();
+    }
+  }
+
+  return { signature, author_pubkey };
+};
+
 const appendFallbackRecord = async (opts = {}) => {
-  // opts: { record_type, brief_version, content_plain }
   const id = uuid();
   const created_at = new Date().toISOString();
   const record_type = opts.record_type || 'system';
@@ -307,7 +285,6 @@ const appendFallbackRecord = async (opts = {}) => {
   const content_hash = crypto.createHash('sha256').update(content_plain).digest('hex');
   const content_encrypted = Buffer.from(content_plain, 'utf8').toString('base64');
 
-  // compute prev_hash from last line if exists
   let prev_hash = null;
   try {
     if (fs.existsSync(fallbackPath)) {
@@ -330,33 +307,7 @@ const appendFallbackRecord = async (opts = {}) => {
     prev_hash = null;
   }
 
-  // signature with NODE_PRIVATE_KEY or NODE_PRIVATE_KEY_B64 if available
-  let signature = null;
-  let author_pubkey = null;
-  let private_key_info = getPrivateKeyInfo();
-  if (private_key_info.private_key_present && private_key_info.private_key_valid && private_key_info.keyObject) {
-    try {
-      // Sign the hex digest string bytes to match existing stored ledger entries.
-      const sign = crypto.sign(null, content_hash, private_key_info.keyObject);
-      signature = sign.toString('base64');
-      author_pubkey = getPublicKeyPemFromPrivate(private_key_info.keyObject) || null;
-    } catch (err) {
-      signature = null;
-      author_pubkey = null;
-    }
-  }
-
-  if (!author_pubkey && signature) {
-    const envPubKey = getEnvNodePublicKey();
-    author_pubkey = envPubKey ? envPubKey.trim() : null;
-  }
-
-  if (!author_pubkey && signature) {
-    const pubKeyPath = path.join(__dirname, '../../config/node-identity.pub');
-    if (fs.existsSync(pubKeyPath)) {
-      author_pubkey = fs.readFileSync(pubKeyPath, 'utf8').trim();
-    }
-  }
+  const { signature, author_pubkey } = signEntry(content_hash);
 
   const entry = {
     id,
@@ -373,6 +324,7 @@ const appendFallbackRecord = async (opts = {}) => {
   };
 
   try {
+    ensureFallbackLedgerReady();
     fs.appendFileSync(fallbackPath, JSON.stringify(entry) + '\n', { encoding: 'utf8' });
     return entry;
   } catch (err) {
@@ -416,6 +368,54 @@ const verifyEntrySignature = (entry) => {
   }
 };
 
+const appendRecord = async (opts = {}) => {
+  const id = uuid();
+  const created_at = new Date().toISOString();
+  const record_type = opts.record_type || 'system';
+  const brief_version = opts.brief_version || process.env.BRIEF_VERSION || '0.0.1';
+  const content_plain = opts.content_plain || '';
+  const content_hash = crypto.createHash('sha256').update(content_plain).digest('hex');
+  const content_encrypted = Buffer.from(content_plain, 'utf8').toString('base64');
+
+  const { signature, author_pubkey } = signEntry(content_hash);
+
+  let prev_hash = null;
+  try {
+    const existing = await getEntries({ limit: 1, offset: 0 });
+    if (Array.isArray(existing) && existing.length > 0) {
+      prev_hash = existing[0].content_hash || null;
+    }
+  } catch (e) {
+    prev_hash = null;
+  }
+
+  const status = 'pending_review';
+  const entry = {
+    id,
+    created_at,
+    record_type,
+    brief_version,
+    content_hash,
+    content_encrypted,
+    author_pubkey,
+    signature,
+    prev_hash,
+    status,
+    board_note: null,
+  };
+
+  if (getSupabaseConfig().available) {
+    try {
+      await supabaseRequest('POST', 'ledger_entries', entry);
+      return entry;
+    } catch (err) {
+      console.error('Supabase ledger insert failed, using fallback:', err.message);
+    }
+  }
+
+  return appendFallbackRecord(opts);
+};
+
 module.exports.isAvailable = isAvailable;
 module.exports.ledgerType = ledgerType;
 module.exports.getLedgerHeight = getLedgerHeight;
@@ -424,49 +424,5 @@ module.exports.appendFallbackRecord = appendFallbackRecord;
 module.exports.readFallbackEntries = readFallbackEntries;
 module.exports.verifyEntrySignature = verifyEntrySignature;
 module.exports.getPrivateKeyInfo = getPrivateKeyInfo;
-// appendRecord: unified append used by application code. Chooses sqlite path if available else fallback
-const appendRecord = async (opts = {}) => {
-  // If sqlite is available, insert via db
-  if (available && db) {
-    return new Promise((resolve, reject) => {
-      const id = uuid();
-      const created_at = new Date().toISOString();
-      const record_type = opts.record_type || 'system';
-      const brief_version = opts.brief_version || process.env.BRIEF_VERSION || '0.0.1';
-      const content_plain = opts.content_plain || '';
-      const content_hash = crypto.createHash('sha256').update(content_plain).digest('hex');
-      const content_encrypted = Buffer.from(content_plain, 'utf8').toString('base64');
-
-      // attempt to sign using available private key
-      let signature = null;
-      let author_pubkey = null;
-      try {
-        const privateInfo = getPrivateKeyInfo();
-        if (privateInfo && privateInfo.private_key_present && privateInfo.private_key_valid && privateInfo.keyObject) {
-          const sign = crypto.sign(null, String(content_hash), privateInfo.keyObject);
-          signature = sign.toString('base64');
-          author_pubkey = getPublicKeyPemFromPrivate(privateInfo.keyObject) || null;
-        }
-      } catch (e) {
-        signature = null;
-        author_pubkey = null;
-      }
-
-      const prev_hash = null;
-      const status = 'pending_review';
-
-      const sql = `INSERT INTO ledger_entries (id, created_at, record_type, brief_version, content_hash, content_encrypted, author_pubkey, signature, prev_hash, status, board_note) VALUES (?,?,?,?,?,?,?,?,?,?,?)`;
-      db.run(sql, [id, created_at, record_type, brief_version, content_hash, content_encrypted, author_pubkey, signature, prev_hash, status, null], function (err) {
-        if (err) return resolve(null);
-        resolve({ id, created_at, record_type, brief_version, content_hash, content_encrypted, author_pubkey, signature, prev_hash, status, board_note: null });
-      });
-    });
-  }
-
-  // otherwise fallback to file-based append
-  return appendFallbackRecord(opts);
-};
-
 module.exports.appendRecord = appendRecord;
 module.exports.resetLedgerStorage = resetLedgerStorage;
-
