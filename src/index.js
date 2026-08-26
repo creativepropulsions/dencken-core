@@ -1,2 +1,8 @@
-// Bootstrap entrypoint for the Dencken server node.
-// This file will initialize scheduler and core services.
+const { startPulseScheduler } = require('./layers/pulse');
+
+const startNodeServices = () => {
+	startPulseScheduler();
+	return true;
+};
+
+module.exports = { startNodeServices };

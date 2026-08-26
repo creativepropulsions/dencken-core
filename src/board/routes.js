@@ -1,11 +1,14 @@
-const express = require('express');
-const router = express.Router();
+const { createRouter } = require('./localHttp');
+const router = createRouter();
 const fs = require('fs');
 const path = require('path');
 const { loadAgentPool } = require('../agents/pool');
 const { simulateDeliberationCycle } = require('../agents/cycle');
 const { getNodeId, getNodePublicKey, getNodeMeta } = require('../core/identity');
 const ledger = require('../core/ledger');
+const { enqueue } = require('../core/taskqueue');
+const { buildChatContext, persistChatTurn } = require('../chat/context');
+const { appendKnowledge } = require('../core/knowledge');
 const { requireAdminAuth, getAdminTokenFromRequest, getAdminToken, isAdminAuthenticated, createAdminAuthCookie, clearAdminAuthCookie } = require('./auth');
 const constitutionStore = require('../core/constitutionStore');
 const { loadConfigConstitution } = require('../core/constitutionStore');
@@ -209,6 +212,70 @@ router.get('/cycle/test/browser', requireAdminAuth, async (req, res) => {
   }
 });
 
+router.get('/cycle/run', requireAdminAuth, (req, res) => {
+  const prompt = String(req.query.prompt || '');
+  return res.type('text/html').send(`<html><head><title>Cycle Runner</title></head><body><h1>Cycle Runner</h1><p><a href="/dashboard">Back to Dashboard</a></p><form method="post" action="/cycle/run"><label>Topic:<br /><textarea name="prompt" rows="5" cols="80">${prompt}</textarea></label><br /><label>Messages per respondent: <input name="max_messages" type="number" min="1" max="20" value="1" /></label><br /><button type="submit">Run Cycle</button></form></body></html>`);
+});
+
+router.post('/cycle/run', requireAdminAuth, async (req, res) => {
+  try {
+    const result = await simulateDeliberationCycle({
+      prompt: req.body && req.body.prompt ? String(req.body.prompt).trim() : undefined,
+      max_messages: req.body && req.body.max_messages ? Number(req.body.max_messages) : 1,
+      use_manifest: true,
+    });
+    if (String(req.headers.accept || '').includes('text/html')) {
+      return res.type('text/html').send(`<html><head><title>Cycle Result</title></head><body><h1>Cycle Result</h1><p><a href="/cycle/run">Run another cycle</a> | <a href="/board">Board Review</a> | <a href="/dashboard">Back to Dashboard</a></p><pre>${JSON.stringify(result, null, 2)}</pre></body></html>`);
+    }
+    return res.json(result);
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+const decodeContent = (entry) => {
+  try { return Buffer.from(entry.content_encrypted || '', 'base64').toString('utf8'); } catch (err) { return ''; }
+};
+
+router.get('/board', requireAdminAuth, async (req, res) => {
+  const entries = await readLedgerEntries({ limit: 25, offset: 0 });
+  const pending = entries.filter((entry) => !entry.status || entry.status === 'pending_review');
+  const rows = pending.map((entry) => `<li><strong>${entry.record_type}</strong> @ ${entry.created_at}<pre>${decodeContent(entry).slice(0, 600)}</pre><form method="post" action="/board/promote/${entry.id}"><input name="board_note" placeholder="Board note"/><input name="follow_up_task" placeholder="Follow-up task"/><button type="submit">Promote</button></form><form method="post" action="/board/discard/${entry.id}"><input name="board_note" placeholder="Board note"/><button type="submit">Discard</button></form></li>`).join('');
+  return res.type('text/html').send(`<html><head><title>Board Review</title></head><body><h1>Board Review</h1><p><a href="/dashboard">Back to Dashboard</a></p><ul>${rows || '<li>No pending entries.</li>'}</ul></body></html>`);
+});
+
+router.post('/board/promote/:id', requireAdminAuth, async (req, res) => {
+  const id = req.params.id;
+  const source = await ledger.getEntryById(id);
+  const update = await ledger.updateRecordStatus(id, 'promoted');
+  await appendLedgerRecord({ record_type: 'board_action', content_plain: JSON.stringify({ action: 'promote', cycle_id: id, note: req.body.board_note || '' }) });
+  if (source) appendKnowledge({ title: `Promoted ${source.record_type}`, summary: decodeContent(source).slice(0, 400), content: decodeContent(source), source_cycle_id: id });
+  if (req.body.follow_up_task) enqueue({ topic: req.body.follow_up_task, source_cycle_id: id });
+  if (String(req.headers.accept || '').includes('text/html')) return res.redirect('/board');
+  return res.json({ ok: true, promoted: id, updated: update });
+});
+
+router.post('/board/discard/:id', requireAdminAuth, async (req, res) => {
+  const id = req.params.id;
+  const update = await ledger.updateRecordStatus(id, 'discarded');
+  await appendLedgerRecord({ record_type: 'board_action', content_plain: JSON.stringify({ action: 'discard', cycle_id: id, note: req.body.board_note || '' }) });
+  if (String(req.headers.accept || '').includes('text/html')) return res.redirect('/board');
+  return res.json({ ok: true, discarded: id, updated: update });
+});
+
+router.get('/chat', requireAdminAuth, (req, res) => {
+  const message = String(req.query.message || 'Hello network');
+  return res.type('text/html').send(`<html><head><title>Chat Explorer</title></head><body><h1>Chat Explorer</h1><p><a href="/dashboard">Back to Dashboard</a></p><form method="post" action="/chat"><textarea name="message">${message}</textarea><button type="submit">Send</button></form><pre>${buildChatContext(message)}</pre></body></html>`);
+});
+
+router.post('/chat', requireAdminAuth, async (req, res) => {
+  const message = String(req.body.message || '').trim();
+  if (!message) return res.status(400).json({ ok: false, error: 'message is required' });
+  const context = buildChatContext(message);
+  const payload = await persistChatTurn({ userMessage: message, agentResponse: `Network response to: ${message}` });
+  return res.json({ ok: true, context, payload });
+});
+
 const formatEnvValue = (value) => {
   if (value === undefined || value === null) return '';
   const str = String(value).replace(/\r\n/g, '\n').replace(/\r/g, '\n');
@@ -218,7 +285,10 @@ const formatEnvValue = (value) => {
 const writeEnvFile = (updates = {}) => {
   const envPath = path.join(__dirname, '../../.env');
   const raw = fs.existsSync(envPath) ? fs.readFileSync(envPath, 'utf8') : '';
-  const parsed = require('dotenv').parse(raw);
+  const parsed = Object.fromEntries(raw.split(/\r?\n/).filter(Boolean).map((line) => {
+    const separator = line.indexOf('=');
+    return separator === -1 ? [line, ''] : [line.slice(0, separator), line.slice(separator + 1).replace(/^"|"$/g, '')];
+  }));
   const merged = { ...parsed, ...updates };
   const lines = Object.entries(merged).map(([key, value]) => {
     if (value === undefined || value === null || value === '') {
@@ -488,6 +558,9 @@ router.get('/dashboard', async (req, res) => {
             <li><a href="/status">/status</a></li>
             <li><a href="/ledger">/ledger</a></li>
             <li><a href="/ledger/test">/ledger/test</a></li>
+            <li><a href="/board">/board</a></li>
+            <li><a href="/chat">/chat</a></li>
+            <li><a href="/cycle/run">/cycle/run</a></li>
             <li><a href="/cycle/test">/cycle/test</a></li>
             <li><a href="/cycle/status">/cycle/status</a></li>
             <li><a href="/setup">/setup</a></li>

@@ -1,0 +1,12 @@
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const dataDir = path.join(__dirname, '../../data');
+const knowledgePath = path.join(dataDir, 'knowledge.jsonl');
+const ensure = () => { if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true }); };
+const hashValue = (value) => crypto.createHash('sha256').update(String(value || '')).digest('hex');
+const readKnowledgeRecords = () => { ensure(); if (!fs.existsSync(knowledgePath)) return []; return fs.readFileSync(knowledgePath, 'utf8').split(/\r?\n/).filter(Boolean).map((line) => { try { return JSON.parse(line); } catch (err) { return null; } }).filter(Boolean); };
+const appendKnowledge = ({ title, summary, content, status = 'promoted', audience = 'internal', source_cycle_id = null }) => { ensure(); const record = { id: crypto.randomUUID(), created_at: new Date().toISOString(), title: String(title || 'Network knowledge'), summary: String(summary || ''), content: String(content || ''), status, audience, source_cycle_id, hash: hashValue(content || summary || title) }; fs.appendFileSync(knowledgePath, `${JSON.stringify(record)}\n`); return record; };
+const listPromotedKnowledge = () => readKnowledgeRecords().filter((record) => record.status === 'promoted' && !record.retracted).sort((a, b) => new Date(b.created_at) - new Date(a.created_at)).slice(0, 20);
+const buildKnowledgeContext = (message = '') => { const words = String(message).toLowerCase().split(/\W+/).filter(Boolean); const records = listPromotedKnowledge().filter((record) => !words.length || words.some((word) => `${record.title} ${record.summary} ${record.content}`.toLowerCase().includes(word))).slice(0, 5); return records.length ? `[Recent network knowledge]\n${records.map((record) => `- ${record.title}: ${(record.summary || record.content).slice(0, 180)}`).join('\n')}\n\n---\n\n${message}` : String(message); };
+module.exports = { appendKnowledge, listPromotedKnowledge, buildKnowledgeContext, readKnowledgeRecords, knowledgePath };
