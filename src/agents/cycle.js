@@ -1,57 +1,19 @@
+const crypto = require('crypto');
 const { loadAgentPool } = require('./pool');
 const ledger = require('../core/ledger');
+const { loadConfigConstitution } = require('../core/constitutionStore');
 
 const defaultPrompt = 'Propose a new action for the network.';
+const hashManifest = (manifest) => manifest && crypto.createHash('sha256').update(JSON.stringify(manifest)).digest('hex');
+const buildManifestReference = (manifest) => manifest ? { id: manifest.id || manifest.name || 'manifest', version: manifest.version || 'unknown', hash: hashManifest(manifest), source: 'loaded-constitution' } : null;
+const rulesOf = (constitution) => (constitution && (constitution.rules || constitution.policy)) || {};
+const maxMessages = (constitution, requested) => Math.max(1, Math.min(20, Number(requested || rulesOf(constitution).max_messages || 3)));
+const rolePrompt = (constitution, role) => { const prompts = constitution && constitution.prompts; return (prompts && prompts[role]) || ({ initiator: 'Propose a concrete action based on the topic and constitutional brief.', respondent: 'Review the full conversation, identify risks, and suggest a concrete refinement.', synthesis: 'Summarize the conversation and recommend the next action or next cycle.' }[role] || 'Reflect on the conversation and propose a next step.'); };
+const historyOf = (conversation) => conversation.length ? conversation.map((item) => `${item.author}: ${item.content}`).join('\n') : 'No prior messages.';
+const buildAgentPrompt = ({ agent, role, prompt, constitution, conversation, limit }) => `${rolePrompt(constitution, role)}\n\nAgent brief: ${agent.brief || 'No additional brief configured.'}\n\nConversation:\n${historyOf(conversation)}\n\nYou are ${agent.label} (${agent.id}), acting as ${role}. Per-agent limit: ${limit}.\nCurrent topic: ${prompt}`;
+const contentFor = ({ role, agent, prompt, conversation, manifest }) => { const suffix = manifest ? ` [manifest:${manifest.id}@${manifest.version}:${manifest.hash}]` : ''; if (role === 'initiator') return `Initiator message: ${prompt}${suffix}`; const previous = conversation[conversation.length - 1]; if (role === 'synthesis') return `Synthesis by ${agent.label}: the conversation recommends reviewing ${previous ? previous.content.slice(0, 220) : prompt} and scheduling the next action if unresolved.${suffix}`; return `${agent.label} responds after reviewing the conversation: refine the proposal with a concrete, verifiable next step.${suffix}`; };
+const pushMessage = async ({ role, agent, prompt, constitution, conversation, entries, manifest, limit }) => { const promptText = buildAgentPrompt({ agent, role, prompt, constitution, conversation, limit }); const content = contentFor({ role, agent, prompt: promptText, conversation, manifest }); const record = await ledger.appendRecord({ record_type: role === 'initiator' ? 'initiator_proposal' : role === 'synthesis' ? 'synthesis' : 'respondent_response', content_plain: content, brief_version: constitution && constitution.version }); entries.push(record); conversation.push({ author: role === 'initiator' ? 'admin' : agent.id, record_type: record.record_type, content, prompt: promptText, created_at: record.created_at }); return { record, content, prompt: promptText }; };
+const buildBoardReview = (branches, synthesis) => ({ status: branches.length ? 'review_required' : 'no_action', summary: branches.length ? `Board review flagged ${branches.length} branch(es).` : 'No branches were produced.', branches: branches.map((branch) => ({ ...branch, decision: /recommend|refine|next step/i.test(branch.latest_summary) ? 'promote' : 'discard', tasks: [{ id: `${branch.id}-task`, title: `Review ${branch.label} recommendation`, branch_id: branch.id, status: 'queued', summary: branch.latest_summary }] })), synthesis });
 
-const chooseAgent = (agents, role) => {
-  return agents.find((agent) => agent.role === role) || agents[0] || null;
-};
-
-const makeContent = (stage, prompt, initiator, respondent) => {
-  switch (stage) {
-    case 'initiator_proposal':
-      return `${initiator.label} (${initiator.id}) proposes: ${prompt}`;
-    case 'respondent_response':
-      return `${respondent.label} (${respondent.id}) responds to ${initiator.label}: I reviewed the proposal and suggest a refinement that improves resilience and clarity.`;
-    case 'synthesis':
-      return `Synthesis by the board: we accept the proposal with the following summary and next step. ${respondent.label}'s refinement has been incorporated.`;
-    default:
-      return `${stage}: ${prompt}`;
-  }
-};
-
-const simulateDeliberationCycle = async (opts = {}) => {
-  const prompt = opts.prompt || defaultPrompt;
-  const agents = loadAgentPool();
-  const initiator = chooseAgent(agents, 'initiator');
-  const respondent = chooseAgent(agents, 'respondent') || initiator;
-
-  if (!initiator || !respondent) {
-    throw new Error('Unable to select cycle agents from pool.');
-  }
-
-  const stages = [
-    { record_type: 'initiator_proposal', author: initiator, prompt },
-    { record_type: 'respondent_response', author: respondent, prompt },
-    { record_type: 'synthesis', author: respondent, prompt },
-  ];
-
-  const entries = [];
-  for (const stage of stages) {
-    const content_plain = makeContent(stage.record_type, prompt, initiator, respondent);
-    const entry = await ledger.appendRecord({ record_type: stage.record_type, content_plain });
-    entries.push(entry);
-  }
-
-  return {
-    ok: true,
-    prompt,
-    initiator,
-    respondent,
-    entries,
-  };
-};
-
-module.exports = {
-  simulateDeliberationCycle,
-};
+const simulateDeliberationCycle = async (opts = {}) => { const constitution = opts.constitution || (opts.use_manifest ? await loadConfigConstitution() : null) || {}; const manifest = opts.manifest || buildManifestReference(constitution); const agents = loadAgentPool(constitution).filter((agent) => agent.active !== false); const initiator = agents.find((agent) => agent.role === 'initiator') || agents[0]; const respondents = agents.filter((agent) => agent.id !== initiator.id && agent.role !== 'synthesis'); const synthesisAgent = agents.find((agent) => agent.role === 'synthesis') || respondents[0] || initiator; if (!initiator || !synthesisAgent) throw new Error('Unable to select cycle agents from pool.'); const prompt = opts.prompt || defaultPrompt; const limit = maxMessages(constitution, opts.max_messages); const entries = []; const conversation = []; const branches = []; await pushMessage({ role: 'initiator', agent: initiator, prompt, constitution, conversation, entries, manifest, limit }); for (const agent of (respondents.length ? respondents : [synthesisAgent])) { const branch = { id: `branch-${branches.length + 1}-${agent.id}`, agent_id: agent.id, label: agent.label, role: agent.role || 'respondent', responses: [] }; for (let turn = 0; turn < limit; turn += 1) { const response = await pushMessage({ role: 'respondent', agent, prompt, constitution, conversation, entries, manifest, limit }); branch.responses.push({ turn: turn + 1, author: agent.id, content: response.content, created_at: response.record.created_at }); } branch.latest_summary = branch.responses[branch.responses.length - 1].content.slice(0, 240); branches.push(branch); } const synthesis = await pushMessage({ role: 'synthesis', agent: synthesisAgent, prompt, constitution, conversation, entries, manifest, limit }); return { ok: true, prompt, initiator, queue: respondents.map((agent) => ({ id: agent.id, label: agent.label, role: agent.role })), synthesis_agent: synthesisAgent, branch_states: branches, board_review: buildBoardReview(branches, synthesis.content), constitution_loaded: Boolean(constitution), manifest, max_message_limit: limit, per_agent_message_limit: limit, total_conversation_messages: conversation.length, entries, conversation }; };
+module.exports = { simulateDeliberationCycle, buildManifestReference, hashManifest, buildAgentPrompt };

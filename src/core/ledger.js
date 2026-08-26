@@ -1,66 +1,12 @@
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
-const https = require('https');
 
 const dataDir = path.join(__dirname, '../../data');
 const fallbackPath = path.join(dataDir, 'ledger.jsonl');
 
 const uuid = (typeof crypto.randomUUID === 'function') ? crypto.randomUUID : () => {
   return ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g, c => (c ^ crypto.randomBytes(1)[0] & 15 >> c / 4).toString(16));
-};
-
-const getSupabaseConfig = () => {
-  const url = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
-  const key = process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY;
-  return { url, key, available: Boolean(url && key) };
-};
-
-const supabaseRequest = (method, tablePath, body = null) => {
-  return new Promise((resolve, reject) => {
-    const { url, key, available } = getSupabaseConfig();
-    if (!available) return reject(new Error('Supabase not configured'));
-
-    const parsed = new URL(url + '/rest/v1/' + tablePath);
-    const headers = {
-      'apikey': key,
-      'Authorization': 'Bearer ' + key,
-      'Content-Type': 'application/json',
-    };
-    if (method === 'POST') headers['Prefer'] = 'return=representation';
-
-    const options = {
-      hostname: parsed.hostname,
-      path: parsed.pathname + parsed.search,
-      method,
-      headers,
-    };
-
-    const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', (d) => data += d);
-      res.on('end', () => {
-        try {
-          const json = data ? JSON.parse(data) : null;
-          if (res.statusCode >= 400) {
-            return reject(new Error(json && json.message ? json.message : `HTTP ${res.statusCode}`));
-          }
-          const countHeader = res.headers['content-range'];
-          let count = null;
-          if (countHeader && countHeader.startsWith('*/')) {
-            count = parseInt(countHeader.substring(2), 10);
-          }
-          resolve({ data: json, count });
-        } catch (e) {
-          if (res.statusCode >= 400) return reject(new Error(`HTTP ${res.statusCode}: ${data}`));
-          resolve({ data: null, count: null });
-        }
-      });
-    });
-    req.on('error', reject);
-    if (body) req.write(JSON.stringify(body));
-    req.end();
-  });
 };
 
 const ensureFallbackLedgerReady = () => {
@@ -89,10 +35,9 @@ const fallbackAvailable = () => {
   }
 };
 
-const isAvailable = () => getSupabaseConfig().available || fallbackAvailable();
+const isAvailable = () => fallbackAvailable();
 
 const ledgerType = () => {
-  if (getSupabaseConfig().available) return 'supabase';
   if (fallbackAvailable()) return 'file fallback';
   return 'unavailable';
 };
@@ -106,28 +51,12 @@ const cleanupLedgerFiles = () => {
 };
 
 const resetLedgerStorage = async () => {
-  if (getSupabaseConfig().available) {
-    try {
-      await supabaseRequest('DELETE', 'ledger_entries?id=neq.0');
-    } catch (err) {
-      console.error('Failed to clear ledger in Supabase:', err.message);
-    }
-  }
   cleanupLedgerFiles();
   ensureFallbackLedgerReady();
   return true;
 };
 
 const getLedgerHeight = async () => {
-  if (getSupabaseConfig().available) {
-    try {
-      const result = await supabaseRequest('GET', 'ledger_entries?select=id&limit=1000');
-      return (result.data || []).length;
-    } catch (err) {
-      console.error('Failed to query ledger height from Supabase:', err.message);
-    }
-  }
-
   try {
     if (!fs.existsSync(fallbackPath)) return 0;
     const data = fs.readFileSync(fallbackPath, 'utf8').trim();
@@ -139,14 +68,6 @@ const getLedgerHeight = async () => {
 };
 
 const getEntries = async ({ limit = 50, offset = 0 } = {}) => {
-  if (getSupabaseConfig().available) {
-    try {
-      const result = await supabaseRequest('GET', `ledger_entries?order=created_at.desc&limit=${limit}&offset=${offset}`);
-      return result.data || [];
-    } catch (err) {
-      console.error('Failed to read ledger entries from Supabase:', err.message);
-    }
-  }
   return readFallbackEntries({ limit, offset });
 };
 
@@ -348,6 +269,26 @@ const readFallbackEntries = ({ limit = 50, offset = 0 } = {}) => {
   }
 };
 
+const getEntryById = async (id) => readFallbackEntries({ limit: 10000, offset: 0 }).find((entry) => entry.id === id) || null;
+
+const updateRecordStatus = async (id, status) => {
+  if (!id) return null;
+  ensureFallbackLedgerReady();
+  const entries = readFallbackEntries({ limit: 10000, offset: 0 });
+  const target = entries.find((entry) => entry.id === id);
+  if (!target) return null;
+  const lines = fs.readFileSync(fallbackPath, 'utf8').split(/\r?\n/).filter(Boolean).map((line) => {
+    try {
+      const entry = JSON.parse(line);
+      return entry.id === id ? JSON.stringify({ ...entry, status: String(status) }) : line;
+    } catch (err) {
+      return line;
+    }
+  });
+  fs.writeFileSync(fallbackPath, `${lines.join('\n')}\n`, 'utf8');
+  return { id, status: String(status) };
+};
+
 const verifyEntrySignature = (entry) => {
   if (!entry || !entry.signature || !entry.author_pubkey || !entry.content_hash) {
     return { ok: false, error: 'Missing signature, author_pubkey, or content_hash' };
@@ -404,15 +345,6 @@ const appendRecord = async (opts = {}) => {
     board_note: null,
   };
 
-  if (getSupabaseConfig().available) {
-    try {
-      await supabaseRequest('POST', 'ledger_entries', entry);
-      return entry;
-    } catch (err) {
-      console.error('Supabase ledger insert failed, using fallback:', err.message);
-    }
-  }
-
   return appendFallbackRecord(opts);
 };
 
@@ -422,6 +354,8 @@ module.exports.getLedgerHeight = getLedgerHeight;
 module.exports.getEntries = getEntries;
 module.exports.appendFallbackRecord = appendFallbackRecord;
 module.exports.readFallbackEntries = readFallbackEntries;
+module.exports.getEntryById = getEntryById;
+module.exports.updateRecordStatus = updateRecordStatus;
 module.exports.verifyEntrySignature = verifyEntrySignature;
 module.exports.getPrivateKeyInfo = getPrivateKeyInfo;
 module.exports.appendRecord = appendRecord;

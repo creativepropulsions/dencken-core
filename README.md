@@ -66,7 +66,7 @@ This app is designed to work in a shared hosting environment with dynamic Node p
 
 ## Repository conventions
 
-- `src/core/` contains the core logic without Express or HTTP coupling
+- `src/core/` contains the core logic without delivery-layer or HTTP coupling
 - `src/board/` contains the web-facing routes and admin board handlers
 - `data/` and `config/` are private runtime storage and should remain out of version control
 - `ledger-public/` is a public-facing log location only and should be treated carefully

@@ -1,61 +1,13 @@
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
-const https = require('https');
 
 const configConstitutionPath = path.join(__dirname, '../../config/constitution.json.enc');
+const dataDir = path.join(__dirname, '../../data');
+const constitutionHistoryPath = path.join(dataDir, 'constitution.jsonl');
 
 const uuid = (typeof crypto.randomUUID === 'function') ? crypto.randomUUID : () => {
   return ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g, c => (c ^ crypto.randomBytes(1)[0] & 15 >> c / 4).toString(16));
-};
-
-const getSupabaseConfig = () => {
-  const url = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
-  const key = process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY;
-  return { url, key, available: Boolean(url && key) };
-};
-
-const supabaseRequest = (method, tablePath, body = null) => {
-  return new Promise((resolve, reject) => {
-    const { url, key, available } = getSupabaseConfig();
-    if (!available) return reject(new Error('Supabase not configured'));
-
-    const parsed = new URL(url + '/rest/v1/' + tablePath);
-    const headers = {
-      'apikey': key,
-      'Authorization': 'Bearer ' + key,
-      'Content-Type': 'application/json',
-      'Prefer': method === 'POST' ? 'return=representation' : 'count=exact',
-    };
-    if (method === 'POST') headers['Prefer'] = 'return=representation';
-
-    const options = {
-      hostname: parsed.hostname,
-      path: parsed.pathname + parsed.search,
-      method,
-      headers,
-    };
-
-    const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', (d) => data += d);
-      res.on('end', () => {
-        try {
-          const json = data ? JSON.parse(data) : null;
-          if (res.statusCode >= 400) {
-            return reject(new Error(json && json.message ? json.message : `HTTP ${res.statusCode}`));
-          }
-          resolve({ data: json, count: res.headers['content-range'] || null });
-        } catch (e) {
-          if (res.statusCode >= 400) return reject(new Error(`HTTP ${res.statusCode}: ${data}`));
-          resolve({ data: null, count: null });
-        }
-      });
-    });
-    req.on('error', reject);
-    if (body) req.write(JSON.stringify(body));
-    req.end();
-  });
 };
 
 const getConstitutionKey = () => process.env.CONSTITUTION_KEY || null;
@@ -108,12 +60,11 @@ const saveConfigConstitution = (encryptedContent) => {
 };
 
 const getLatestRecord = async () => {
-  if (!getSupabaseConfig().available) return null;
   try {
-    const result = await supabaseRequest('GET', 'constitution_records?order=created_at.desc&limit=1');
-    return (result.data && result.data.length > 0) ? result.data[0] : null;
+    if (!fs.existsSync(constitutionHistoryPath)) return null;
+    const records = fs.readFileSync(constitutionHistoryPath, 'utf8').split(/\r?\n/).filter(Boolean);
+    return records.length ? JSON.parse(records[records.length - 1]) : null;
   } catch (err) {
-    console.error('Failed to read latest constitution from Supabase:', err.message);
     return null;
   }
 };
@@ -163,13 +114,10 @@ const storeConstitution = async ({ constitution }) => {
     board_note: null,
   };
 
-  try {
-    await supabaseRequest('POST', 'constitution_records', record);
-    saveConfigConstitution(encryptedContent);
-    return record;
-  } catch (err) {
-    throw new Error('Failed to store constitution: ' + err.message);
-  }
+  if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
+  fs.appendFileSync(constitutionHistoryPath, `${JSON.stringify(record)}\n`, 'utf8');
+  saveConfigConstitution(encryptedContent);
+  return record;
 };
 
 module.exports = { getLatestConstitution, storeConstitution, loadConfigConstitution };
