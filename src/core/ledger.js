@@ -2,6 +2,8 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 
+console.log('[LEDGER] Module loaded');
+
 const dataDir = path.join(__dirname, '../../data');
 const fallbackPath = path.join(dataDir, 'ledger.jsonl');
 
@@ -115,23 +117,50 @@ const getEnvNodePublicKey = () => {
 };
 
 const getPrivateKeyInfo = () => {
+  console.log('[LEDGER] getPrivateKeyInfo called');
+  console.log('[LEDGER] NODE_PRIVATE_KEY env set:', !!process.env.NODE_PRIVATE_KEY);
+  console.log('[LEDGER] NODE_PRIVATE_KEY_B64 env set:', !!process.env.NODE_PRIVATE_KEY_B64);
+  
   const tryCreateKey = (rawKey, source) => {
     if (!rawKey) {
+      console.log(`[LEDGER] Private key not provided from ${source}`);
       return { private_key_present: false, private_key_source: null, private_key_valid: false, private_key_error: null, keyObject: null };
     }
 
-    if (rawKey.indexOf('\\n') !== -1) {
-      rawKey = rawKey.replace(/\\n/g, '\n');
+    let keyMaterial = rawKey;
+    
+    // Handle escaped newlines
+    if (keyMaterial.indexOf('\\n') !== -1) {
+      keyMaterial = keyMaterial.replace(/\\n/g, '\n');
+    }
+
+    // If it looks like base64 DER (not PEM), decode it
+    const isBase64 = /^[A-Za-z0-9+/]*={0,2}$/.test(keyMaterial.replace(/\s+/g, ''));
+    const isPem = keyMaterial.includes('-----BEGIN');
+    
+    if (isBase64 && !isPem) {
+      console.log(`[LEDGER] Detected base64 DER format for ${source}, decoding...`);
+      try {
+        keyMaterial = Buffer.from(keyMaterial.replace(/\s+/g, ''), 'base64');
+      } catch (err) {
+        console.error(`[LEDGER] Failed to decode base64 for ${source}:`, err.message);
+        return { private_key_present: true, private_key_source: source, private_key_valid: false, private_key_error: 'Invalid base64 format', keyObject: null };
+      }
     }
 
     try {
-      const keyObject = crypto.createPrivateKey(rawKey);
+      const keyObject = crypto.createPrivateKey(
+        Buffer.isBuffer(keyMaterial) ? { key: keyMaterial, format: 'der', type: 'pkcs8' } : keyMaterial
+      );
+      console.log(`[LEDGER] Successfully loaded private key from ${source}`);
       return { private_key_present: true, private_key_source: source, private_key_valid: true, private_key_error: null, keyObject };
     } catch (err) {
       try {
-        const keyObject = crypto.createPrivateKey({ key: rawKey, format: 'pem', type: 'pkcs8' });
+        const keyObject = crypto.createPrivateKey({ key: keyMaterial, format: Buffer.isBuffer(keyMaterial) ? 'der' : 'pem', type: 'pkcs8' });
+        console.log(`[LEDGER] Successfully loaded private key from ${source} (pkcs8 format)`);
         return { private_key_present: true, private_key_source: source, private_key_valid: true, private_key_error: null, keyObject };
       } catch (innerErr) {
+        console.error(`[LEDGER] Failed to load private key from ${source}:`, innerErr.message);
         return { private_key_present: true, private_key_source: source, private_key_valid: false, private_key_error: innerErr.message, keyObject: null };
       }
     }
@@ -150,11 +179,13 @@ const getPrivateKeyInfo = () => {
     try {
       pkB64 = Buffer.from(pkB64, 'base64').toString('utf8');
     } catch (err) {
+      console.error('[LEDGER] NODE_PRIVATE_KEY_B64 is not valid base64');
       return { private_key_present: true, private_key_source: 'NODE_PRIVATE_KEY_B64', private_key_valid: false, private_key_error: 'Invalid base64', keyObject: null };
     }
     return tryCreateKey(pkB64, 'NODE_PRIVATE_KEY_B64');
   }
 
+  console.warn('[LEDGER] No NODE_PRIVATE_KEY or NODE_PRIVATE_KEY_B64 environment variable found - ledger entries will NOT be signed');
   return { private_key_present: false, private_key_source: null, private_key_valid: false, private_key_error: null, keyObject: null };
 };
 
@@ -167,18 +198,25 @@ const getPublicKeyPemFromPrivate = (keyObject) => {
 };
 
 const signEntry = (content_hash) => {
+  console.log('[LEDGER] signEntry called, checking for private key...');
   let signature = null;
   let author_pubkey = null;
   const privateInfo = getPrivateKeyInfo();
+  
   if (privateInfo && privateInfo.private_key_present && privateInfo.private_key_valid && privateInfo.keyObject) {
     try {
       const sign = crypto.sign(null, String(content_hash), privateInfo.keyObject);
       signature = sign.toString('base64');
       author_pubkey = getPublicKeyPemFromPrivate(privateInfo.keyObject) || null;
+      console.log(`[LEDGER] Successfully signed entry with ${privateInfo.private_key_source}`);
     } catch (err) {
+      console.error(`[LEDGER] Failed to sign entry with ${privateInfo.private_key_source}:`, err.message);
       signature = null;
       author_pubkey = null;
     }
+  } else {
+    const reason = !privateInfo.private_key_present ? 'key not present' : !privateInfo.private_key_valid ? `key invalid: ${privateInfo.private_key_error}` : 'unknown';
+    console.warn(`[LEDGER] Cannot sign entry - ${reason}`);
   }
 
   if (!author_pubkey && signature) {
@@ -197,11 +235,13 @@ const signEntry = (content_hash) => {
 };
 
 const appendFallbackRecord = async (opts = {}) => {
+  console.log('[LEDGER] appendFallbackRecord called with record_type:', opts.record_type);
   const id = uuid();
   const created_at = new Date().toISOString();
   const record_type = opts.record_type || 'system';
   const brief_version = opts.brief_version || process.env.BRIEF_VERSION || '0.0.1';
   const content_plain = opts.content_plain || '';
+  const status = opts.status || 'pending_review';
 
   const content_hash = crypto.createHash('sha256').update(content_plain).digest('hex');
   const content_encrypted = Buffer.from(content_plain, 'utf8').toString('base64');
@@ -229,6 +269,8 @@ const appendFallbackRecord = async (opts = {}) => {
   }
 
   const { signature, author_pubkey } = signEntry(content_hash);
+  
+  console.log(`[LEDGER] Appending ${record_type}: signature=${signature ? 'YES' : 'NO'}, pubkey=${author_pubkey ? 'YES' : 'NO'}`);
 
   const entry = {
     id,
@@ -240,15 +282,20 @@ const appendFallbackRecord = async (opts = {}) => {
     author_pubkey,
     signature,
     prev_hash,
-    status: 'pending_review',
+    status,
+    field: opts.field || 'operational',
+    audience: opts.audience || 'internal',
+    graph_type: opts.graph_type || 'task_state',
     board_note: null,
   };
 
   try {
     ensureFallbackLedgerReady();
     fs.appendFileSync(fallbackPath, JSON.stringify(entry) + '\n', { encoding: 'utf8' });
+    console.log(`[LEDGER] Successfully wrote entry ${id} to ledger`);
     return entry;
   } catch (err) {
+    console.error(`[LEDGER] Failed to write entry: ${err.message}`);
     throw new Error('Failed to append fallback ledger record: ' + err.message);
   }
 };
@@ -270,6 +317,7 @@ const readFallbackEntries = ({ limit = 50, offset = 0 } = {}) => {
 };
 
 const getEntryById = async (id) => readFallbackEntries({ limit: 10000, offset: 0 }).find((entry) => entry.id === id) || null;
+const getLastByType = async (recordType) => readFallbackEntries({ limit: 10000, offset: 0 }).find((entry) => entry.record_type === recordType) || null;
 
 const updateRecordStatus = async (id, status) => {
   if (!id) return null;
@@ -310,41 +358,7 @@ const verifyEntrySignature = (entry) => {
 };
 
 const appendRecord = async (opts = {}) => {
-  const id = uuid();
-  const created_at = new Date().toISOString();
-  const record_type = opts.record_type || 'system';
-  const brief_version = opts.brief_version || process.env.BRIEF_VERSION || '0.0.1';
-  const content_plain = opts.content_plain || '';
-  const content_hash = crypto.createHash('sha256').update(content_plain).digest('hex');
-  const content_encrypted = Buffer.from(content_plain, 'utf8').toString('base64');
-
-  const { signature, author_pubkey } = signEntry(content_hash);
-
-  let prev_hash = null;
-  try {
-    const existing = await getEntries({ limit: 1, offset: 0 });
-    if (Array.isArray(existing) && existing.length > 0) {
-      prev_hash = existing[0].content_hash || null;
-    }
-  } catch (e) {
-    prev_hash = null;
-  }
-
-  const status = 'pending_review';
-  const entry = {
-    id,
-    created_at,
-    record_type,
-    brief_version,
-    content_hash,
-    content_encrypted,
-    author_pubkey,
-    signature,
-    prev_hash,
-    status,
-    board_note: null,
-  };
-
+  // Single entry point - delegates to the worker function
   return appendFallbackRecord(opts);
 };
 
@@ -355,6 +369,7 @@ module.exports.getEntries = getEntries;
 module.exports.appendFallbackRecord = appendFallbackRecord;
 module.exports.readFallbackEntries = readFallbackEntries;
 module.exports.getEntryById = getEntryById;
+module.exports.getLastByType = getLastByType;
 module.exports.updateRecordStatus = updateRecordStatus;
 module.exports.verifyEntrySignature = verifyEntrySignature;
 module.exports.getPrivateKeyInfo = getPrivateKeyInfo;

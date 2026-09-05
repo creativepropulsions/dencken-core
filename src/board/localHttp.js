@@ -57,6 +57,9 @@ const createRouter = () => {
   const router = {
     get(pattern, ...handlers) { routes.push({ method: 'GET', ...parseRoute(pattern), handlers }); return router; },
     post(pattern, ...handlers) { routes.push({ method: 'POST', ...parseRoute(pattern), handlers }); return router; },
+    put(pattern, ...handlers) { routes.push({ method: 'PUT', ...parseRoute(pattern), handlers }); return router; },
+    patch(pattern, ...handlers) { routes.push({ method: 'PATCH', ...parseRoute(pattern), handlers }); return router; },
+    delete(pattern, ...handlers) { routes.push({ method: 'DELETE', ...parseRoute(pattern), handlers }); return router; },
     async handle(req, res) {
       const requestUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
       const route = routes.find((candidate) => candidate.method === req.method && candidate.regex.test(requestUrl.pathname));
@@ -97,6 +100,10 @@ const createApp = () => {
       return app;
     },
     get(pattern, ...handlers) { appRoutes.push({ method: 'GET', ...parseRoute(pattern), handlers }); return app; },
+    post(pattern, ...handlers) { appRoutes.push({ method: 'POST', ...parseRoute(pattern), handlers }); return app; },
+    put(pattern, ...handlers) { appRoutes.push({ method: 'PUT', ...parseRoute(pattern), handlers }); return app; },
+    patch(pattern, ...handlers) { appRoutes.push({ method: 'PATCH', ...parseRoute(pattern), handlers }); return app; },
+    delete(pattern, ...handlers) { appRoutes.push({ method: 'DELETE', ...parseRoute(pattern), handlers }); return app; },
     listen(port, host, callback) {
       const server = http.createServer(async (request, response) => {
         const res = createResponse(response);
