@@ -1,6 +1,6 @@
 MIT License
 
-Copyright (c) 2026 dencken-network
+Copyright (c) 2025-2026 CP Müller / Oddsized / Dencken Network
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -19,3 +19,18 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---
+
+IMPORTANT — DUAL LAYER NOTICE:
+
+This MIT Licence covers the application code only (src/, app.js, config
+templates, and related implementation files).
+
+The Dencken Network constitutional framework, fractal architecture design,
+philosophical manifest, and meta-intelligence architecture are NOT covered
+by this MIT Licence. They remain the exclusive intellectual property of
+CP Müller / Oddsized under separate copyright.
+
+See COPYRIGHT.md and github.com/dencken-network/dencken-constitution
+for the full terms governing the constitutional and architectural layer.
