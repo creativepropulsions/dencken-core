@@ -20,6 +20,7 @@ tmp/
 
 # Editor / tooling
 .github/
+.github/**
 .vscode/
 .DS_Store
 
