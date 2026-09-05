@@ -19,6 +19,7 @@ ledger-public/
 tmp/
 
 # Editor / tooling
+.github
 .github/
 .github/**
 .vscode/
