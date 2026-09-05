@@ -82,6 +82,8 @@ const loadConfigConstitution = async () => {
   }
 };
 
+const isLoaded = async () => Boolean(await loadConfigConstitution());
+
 const getLatestConstitution = async () => {
   const record = await getLatestRecord();
   if (!record) return null;
@@ -120,4 +122,4 @@ const storeConstitution = async ({ constitution }) => {
   return record;
 };
 
-module.exports = { getLatestConstitution, storeConstitution, loadConfigConstitution };
+module.exports = { getLatestConstitution, storeConstitution, loadConfigConstitution, isLoaded };

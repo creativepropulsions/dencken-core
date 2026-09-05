@@ -81,8 +81,11 @@ const getNodePublicKey = () => {
   return null;
 };
 
+const isReady = () => Boolean(getNodeId() && getNodePublicKey());
+
 module.exports = {
   getNodeId,
   getNodePublicKey,
   getNodeMeta,
+  isReady,
 };

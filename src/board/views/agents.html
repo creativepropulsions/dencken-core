@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Agent Manager</title>
+</head>
+<body>
+  <h1>Agent Manager</h1>
+  <p>API keys are saved to <code>localStorage</code> in your browser and to the server's encrypted keychain.</p>
+
+  <nav>
+    <button class="tab-btn active" data-tab="agents">Saved Agents</button>
+    <button class="tab-btn" data-tab="add">Add Agent</button>
+    <button class="tab-btn" data-tab="export">Export/Import</button>
+  </nav>
+  <p id="agentResult" role="status"></p>
+
+  <section id="agents" class="section active">
+    <h2>Configured Agents</h2>
+    <div id="agentsList"></div>
+  </section>
+
+  <section id="add" class="section">
+    <h2>Add New Agent</h2>
+    <form id="addAgentForm">
+      <label for="agentId">Agent ID</label><br>
+      <input type="text" id="agentId" name="agentId" placeholder="e.g., agent-cso" required><br>
+
+      <label for="agentLabel">Agent Label</label><br>
+      <input type="text" id="agentLabel" name="agentLabel" placeholder="e.g., Chief Strategy Officer" required><br>
+
+      <label for="agentProvider">Provider</label><br>
+      <select id="agentProvider" name="agentProvider" required>
+        <option value="">-- Select Provider --</option>
+        <option value="openrouter">OpenRouter</option>
+        <option value="groq">Groq</option>
+        <option value="gemini">Gemini</option>
+        <option value="local">Local (Simulation)</option>
+      </select><br>
+
+      <label for="agentModel">Model</label><br>
+      <input type="text" id="agentModel" name="agentModel" placeholder="e.g., mistralai/mistral-7b-instruct:free" required><br>
+      <button type="button" id="loadModelsBtn">Load verified available models</button>
+      <select id="verifiedModels" disabled><option value="">Select a verified model</option></select><br>
+      <button type="button" id="testProfileBtn">Test selected provider/model</button><br><br>
+
+      <label for="agentApiKey">API Key</label><br>
+      <input type="password" id="agentApiKey" name="agentApiKey" placeholder="Your API key" required><br>
+
+      <label for="agentBrief">Agent Brief/Description</label><br>
+      <input type="text" id="agentBrief" name="agentBrief" placeholder="e.g., Synthesize deliberation..."><br><br>
+
+      <label><input type="checkbox" id="agentPreferred" name="agentPreferred"> Preferred provider profile</label><br><br>
+
+      <button type="submit">Save Agent</button>
+    </form>
+  </section>
+
+  <section id="export" class="section">
+    <h2>Export / Import Agents</h2>
+    <p>Backup and restore your agent configuration.</p>
+    <button id="exportBtn">Export Agents (JSON)</button>
+    <button id="importBtn">Import Agents (JSON)</button>
+    <input type="file" id="importFile" accept=".json" style="display: none;">
+    <button id="clearAllBtn">Clear All Agents</button>
+  </section>
+
+  <script>
+    const STORAGE_KEY = 'dencken_agents';
+    const DEFAULT_AGENTS = [
+      {
+        agent_id: 'agent-alpha',
+        agent_label: 'Alpha',
+        provider: 'openrouter',
+        model: 'mistralai/mistral-7b-instruct',
+        api_key: '',
+        brief: 'Chief Proposer: articulate the network topic and initial position.',
+      },
+      {
+        agent_id: 'agent-beta',
+        agent_label: 'Beta',
+        provider: 'groq',
+        model: 'llama3-8b-8192',
+        api_key: '',
+        brief: 'Strategic Respondent: review proposals and identify risks.',
+      },
+      {
+        agent_id: 'agent-cso',
+        agent_label: 'Chief Strategy Officer',
+        provider: 'openrouter',
+        model: 'mistralai/mistral-large-latest',
+        api_key: '',
+        brief: 'CSO: synthesize deliberation, assess risks, recommend board actions.',
+      },
+      {
+        agent_id: 'agent-gemini',
+        agent_label: 'Gemini Fallback',
+        provider: 'gemini',
+        model: 'gemini-2.0-flash',
+        api_key: '',
+        brief: 'Available as a provider fallback for any network role.',
+        preferred: false,
+      },
+    ];
+
+    function loadAgents() {
+      const stored = localStorage.getItem(STORAGE_KEY);
+      if (!stored) {
+        return DEFAULT_AGENTS;
+      }
+      try {
+        return JSON.parse(stored);
+      } catch (e) {
+        console.error('Failed to parse agents from localStorage:', e);
+        return DEFAULT_AGENTS;
+      }
+    }
+
+    function saveAgents(agents) {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(agents, null, 2));
+    }
+
+    function showResult(message, isError = false) {
+      const result = document.getElementById('agentResult');
+      result.textContent = message;
+      result.style.color = isError ? 'darkred' : 'darkgreen';
+    }
+
+    function renderAgents() {
+      const agents = loadAgents();
+      const container = document.getElementById('agentsList');
+
+      if (agents.length === 0) {
+        container.innerHTML = '<p>No agents configured. Add your first agent above.</p>';
+        return;
+      }
+
+      container.innerHTML = agents
+        .map(
+          (agent) => `
+        <div class="agent-card">
+          <h3>${agent.agent_label} - ${agent.api_key ? 'Configured' : 'No Key'}${agent.preferred ? ' - Preferred' : ''}</h3>
+          <div><strong>ID:</strong> ${agent.agent_id}</div>
+          <div><strong>Provider:</strong> ${agent.provider}</div>
+          <div><strong>Model:</strong> ${agent.model}</div>
+          <div><strong>Brief:</strong> ${agent.brief || 'No description'}</div>
+          <div>
+            <button onclick="testAgent('${agent.agent_id}', this)">Test Connection</button>
+            <button onclick="editAgent('${agent.agent_id}')">Edit</button>
+            <button onclick="deleteAgent('${agent.agent_id}')">Delete</button>
+          </div>
+        </div>
+      `
+        )
+        .join('');
+    }
+
+    async function testAgent(agentId, btn) {
+      btn.disabled = true;
+      btn.textContent = 'Testing...';
+
+      try {
+        const response = await fetch(`/agents/test/${agentId}`, { method: 'POST' });
+        const result = await response.json();
+        showResult(result.ok
+          ? `${result.requested_agent_id}: verified directly via ${result.profile_agent_id} on ${result.provider}/${result.model} (${result.tokens_used} tokens). ${result.content}`
+          : `${result.requested_agent_id || agentId}: direct profile test failed. ${result.error || result.content || ''}`, !result.ok);
+      } catch (err) {
+        showResult(`Test request failed: ${err.message}`, true);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Test Connection';
+      }
+    }
+
+    document.getElementById('loadModelsBtn').addEventListener('click', async () => {
+      const provider = document.getElementById('agentProvider').value;
+      const api_key = document.getElementById('agentApiKey').value;
+      const select = document.getElementById('verifiedModels');
+
+      if (!provider || !api_key || provider === 'local') {
+        showResult('Choose a remote provider and enter its API key before loading models.', true);
+        return;
+      }
+
+      select.disabled = true;
+      select.innerHTML = '<option>Loading verified models...</option>';
+      try {
+        const response = await fetch(`/agents/models/${encodeURIComponent(provider)}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ api_key }),
+        });
+        const result = await response.json();
+        if (!result.ok) throw new Error(result.error || 'Provider did not return a model list');
+
+        const models = result.models.filter((model) => provider !== 'openrouter' || model.free);
+        select.innerHTML = '<option value="">Select a live available model</option>' + models
+          .map((model) => `<option value="${model.id}">${model.id}${model.free ? ' (free)' : ''}</option>`)
+          .join('');
+        select.disabled = false;
+        showResult(`${result.model_count} ${provider} models discovered from its live catalog. Select one, then use Test selected provider/model to verify a completion.`);
+      } catch (err) {
+        select.innerHTML = '<option value="">No verified models available</option>';
+        showResult(`Model lookup failed: ${err.message}`, true);
+      }
+    });
+
+    document.getElementById('verifiedModels').addEventListener('change', (event) => {
+      if (event.target.value) document.getElementById('agentModel').value = event.target.value;
+    });
+
+    document.getElementById('testProfileBtn').addEventListener('click', async () => {
+      const provider = document.getElementById('agentProvider').value;
+      const model = document.getElementById('agentModel').value;
+      const api_key = document.getElementById('agentApiKey').value;
+      const button = document.getElementById('testProfileBtn');
+
+      if (!provider || !model || !api_key || provider === 'local') {
+        showResult('Choose a remote provider, a model, and enter its API key before testing.', true);
+        return;
+      }
+
+      button.disabled = true;
+      button.textContent = 'Testing selected profile...';
+      try {
+        const response = await fetch('/agents/profiles/test', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ provider, model, api_key }),
+        });
+        const result = await response.json();
+        showResult(result.ok
+          ? `Verified: ${result.provider}/${result.model} (${result.tokens_used} tokens). ${result.content}`
+          : `Selected profile test failed: ${result.error || 'unknown error'}`, !result.ok);
+      } catch (err) {
+        showResult(`Selected profile test failed: ${err.message}`, true);
+      } finally {
+        button.disabled = false;
+        button.textContent = 'Test selected provider/model';
+      }
+    });
+
+    function editAgent(agentId) {
+      const agents = loadAgents();
+      const agent = agents.find((a) => a.agent_id === agentId);
+
+      if (!agent) return;
+
+      document.getElementById('agentId').value = agent.agent_id;
+      document.getElementById('agentLabel').value = agent.agent_label;
+      document.getElementById('agentProvider').value = agent.provider;
+      document.getElementById('agentModel').value = agent.model;
+      document.getElementById('agentApiKey').value = agent.api_key;
+      document.getElementById('agentBrief').value = agent.brief;
+      document.getElementById('agentPreferred').checked = Boolean(agent.preferred);
+
+      document.querySelector('[data-tab="add"]').click();
+      window.scrollTo(0, 0);
+    }
+
+    function deleteAgent(agentId) {
+      let agents = loadAgents();
+      agents = agents.filter((a) => a.agent_id !== agentId);
+      saveAgents(agents);
+      renderAgents();
+      showResult(`${agentId} removed from this browser. Its server keychain profile remains until deleted through the server API.`);
+    }
+
+    document.getElementById('addAgentForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+
+      const agent = {
+        agent_id: document.getElementById('agentId').value,
+        agent_label: document.getElementById('agentLabel').value,
+        provider: document.getElementById('agentProvider').value,
+        model: document.getElementById('agentModel').value,
+        api_key: document.getElementById('agentApiKey').value,
+        brief: document.getElementById('agentBrief').value,
+        preferred: document.getElementById('agentPreferred').checked,
+      };
+
+      // Save to browser localStorage
+      let agents = loadAgents();
+      const existing = agents.findIndex((a) => a.agent_id === agent.agent_id);
+      if (existing >= 0) {
+        agents[existing] = agent;
+      } else {
+        agents.push(agent);
+      }
+      saveAgents(agents);
+
+      // IMPORTANT: Also save to server's encrypted keychain
+      if (agent.api_key) {
+        try {
+          const serverResponse = await fetch('/agents/keychain', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              agent_id: agent.agent_id,
+              api_key: agent.api_key,
+              provider: agent.provider,
+              model: agent.model,
+              preferred: agent.preferred,
+            })
+          });
+          
+          if (serverResponse.ok) {
+            showResult(`Agent ${agent.agent_id} saved to the server keychain${agent.preferred ? ' as a preferred profile' : ''}.`);
+          } else {
+            const err = await serverResponse.json();
+            showResult(`Server error: ${err.error}`, true);
+          }
+        } catch (err) {
+          showResult(`Failed to save to server: ${err.message}`, true);
+        }
+      } else {
+        showResult('API key is required to save to server.', true);
+      }
+
+      document.getElementById('addAgentForm').reset();
+      renderAgents();
+
+      // Switch to agents tab
+      document.querySelector('[data-tab="agents"]').click();
+    });
+
+    document.getElementById('exportBtn').addEventListener('click', () => {
+      const agents = loadAgents();
+      const dataStr = JSON.stringify(agents, null, 2);
+      const dataUri = 'data:application/json;charset=utf-8,' + encodeURIComponent(dataStr);
+      const link = document.createElement('a');
+      link.href = dataUri;
+      link.download = `dencken_agents_${new Date().toISOString().slice(0, 10)}.json`;
+      link.click();
+    });
+
+    document.getElementById('importBtn').addEventListener('click', () => {
+      document.getElementById('importFile').click();
+    });
+
+    document.getElementById('importFile').addEventListener('change', (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        try {
+          const agents = JSON.parse(event.target.result);
+          if (!Array.isArray(agents)) throw new Error('Invalid format');
+          saveAgents(agents);
+          renderAgents();
+          showResult('Agents imported successfully. Re-save each profile to update the server keychain.');
+        } catch (error) {
+          showResult(`Import failed: ${error.message}`, true);
+        }
+      };
+      reader.readAsText(file);
+    });
+
+    document.getElementById('clearAllBtn').addEventListener('click', () => {
+      saveAgents([]);
+      renderAgents();
+      showResult('All browser-local agents cleared. Server keychain profiles were not changed.');
+    });
+
+    // Tab navigation
+    document.querySelectorAll('.tab-btn').forEach((btn) => {
+      btn.addEventListener('click', (e) => {
+        document.querySelectorAll('.tab-btn').forEach((b) => b.classList.remove('active'));
+        document.querySelectorAll('.section').forEach((s) => s.classList.remove('active'));
+
+        e.target.classList.add('active');
+        const tabId = e.target.getAttribute('data-tab');
+        document.getElementById(tabId).classList.add('active');
+      });
+    });
+
+    // Initial render
+    renderAgents();
+  </script>
+</body>
+</html>
